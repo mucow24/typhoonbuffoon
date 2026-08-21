@@ -2,10 +2,13 @@ import { Application, Container } from 'pixi.js'
 
 export interface Renderer {
   app: Application
+  /** Screen-space backdrop drawn BEHIND the world, in CSS pixels. */
+  background: Container
   /** Everything that lives in world space (pan/zoom/parallax applies). */
   world: Container
   /** Screen-space overlay drawn on top of the world, in CSS pixels. */
   screen: Container
+  /** Viewport size in CSS pixels. */
   width: number
   height: number
 }
@@ -31,22 +34,31 @@ export async function createRenderer(): Promise<Renderer> {
   app.ticker.stop()
   host.appendChild(app.canvas)
 
+  // Z-order matters: the backdrop has to be added BEFORE the world, or the sky
+  // paints straight over the entire scene.
+  const background = new Container()
   const world = new Container()
   const screen = new Container()
+  app.stage.addChild(background)
   app.stage.addChild(world)
   app.stage.addChild(screen)
 
+  // Pixi v8's renderer.width/height are already in CSS pixels - they are the
+  // screen rect, not the backing store. Dividing by resolution shrinks the
+  // viewport, which throws off both the screen-space backdrop and the camera
+  // that centres the world on viewW/2.
   const renderer: Renderer = {
     app,
+    background,
     world,
     screen,
-    width: app.renderer.width / app.renderer.resolution,
-    height: app.renderer.height / app.renderer.resolution,
+    width: app.renderer.width,
+    height: app.renderer.height,
   }
 
   const syncSize = () => {
-    renderer.width = app.renderer.width / app.renderer.resolution
-    renderer.height = app.renderer.height / app.renderer.resolution
+    renderer.width = app.renderer.width
+    renderer.height = app.renderer.height
   }
   app.renderer.on('resize', syncSize)
   syncSize()

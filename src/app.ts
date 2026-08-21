@@ -53,7 +53,7 @@ export class Game {
     this.rng = new Rng(0xf100d)
     this.camera = new Camera()
     this.field = new Field(120)
-    this.scenery = new Scenery(renderer.world, renderer.screen, this.field)
+    this.scenery = new Scenery(renderer.world, renderer.background, this.field)
 
     this.sim = new SimWorld()
     this.sim.terrain = this.field.terrain

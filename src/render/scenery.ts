@@ -20,7 +20,6 @@ const PALETTE = {
   nearDune: [0xd8c79e, 0x9b9280],
   sand: [0xe3d2a4, 0xa89f87],
   wetSand: [0xc4b184, 0x8d856f],
-  seabed: [0x9c8f6d, 0x70695a],
 } as const
 
 const mix = (pair: readonly [number, number], t: number): number => {
@@ -44,14 +43,43 @@ interface ParallaxLayer {
   factor: number
 }
 
+interface Rect {
+  x0: number
+  x1: number
+  y0: number
+  y1: number
+}
+
+/** World-space spacing between dune samples. Fixed, so dunes tile as you pan. */
+const DUNE_STEP = 11
+/** Horizontal period for repeating clouds. */
+const CLOUD_PERIOD = 180
 /**
- * Background scenery: flat bands and silhouettes, parallaxed. Severity greys
- * the whole palette down in one place, which is all the sky ramp needs to be.
+ * Sea horizon in the far-sea layer's own space. Deliberately ABOVE the dune
+ * silhouettes: every backdrop layer fills downward from its own top edge, so
+ * each nearer layer hides the one behind it below that edge. The ocean is only
+ * visible at all because its horizon sits higher than the dunes in front of it.
+ */
+const SEA_HORIZON = 15
+
+/**
+ * Background scenery: flat bands and silhouettes, parallaxed.
+ *
+ * Every layer is drawn to cover the region actually visible in ITS OWN parallax
+ * space, recomputed whenever the camera moves. Drawing them across a fixed
+ * world span instead meant that zooming out past that span left each layer
+ * ending at a different screen position - hard-edged boxes with sky showing
+ * through underneath. Backdrops have to be unbounded; they are the thing you
+ * can never reach the edge of.
+ *
+ * Dunes and clouds tile by index rather than being generated across a fixed
+ * width, so they extend forever without needing more data.
  */
 export class Scenery {
   private readonly layers: ParallaxLayer[] = []
   private severity = 0
   private dirty = true
+  private lastKey = ''
 
   private readonly sky = new Graphics()
   private readonly clouds = new Graphics()
@@ -61,16 +89,17 @@ export class Scenery {
   private readonly ground = new Graphics()
 
   private cloudSpecs: { x: number; y: number; w: number; h: number; dark: boolean }[] = []
-  private duneFarSpec: number[] = []
-  private duneNearSpec: number[] = []
+  private duneFar: number[] = []
+  private duneNear: number[] = []
 
   constructor(
     private readonly world: Container,
-    private readonly screen: Container,
+    private readonly background: Container,
     private readonly field: Field,
   ) {
-    // Sky is screen space - it should not pan at all.
-    this.screen.addChildAt(this.sky, 0)
+    // Sky is screen space and must sit BEHIND the world, not in the overlay
+    // container - putting it in the overlay painted it over the whole scene.
+    this.background.addChild(this.sky)
 
     this.addLayer(this.clouds, 0.1)
     this.addLayer(this.farSea, 0.25)
@@ -78,9 +107,8 @@ export class Scenery {
     this.addLayer(this.dunesNear, 0.7)
     this.addLayer(this.ground, 1)
 
-    this.rebuildSpecs()
+    this.buildSpecs()
     this.field.onChange(() => {
-      this.rebuildSpecs()
       this.dirty = true
     })
   }
@@ -99,101 +127,159 @@ export class Scenery {
     this.dirty = true
   }
 
-  private rebuildSpecs(): void {
+  invalidate(): void {
+    this.dirty = true
+  }
+
+  /** Deterministic, and independent of field width so it never needs rebuilding. */
+  private buildSpecs(): void {
     const rng = new Rng(0x5c3ee)
-    const w = this.field.widthM
-    const span = w * 2.2
 
     this.cloudSpecs = []
-    const cloudCount = Math.max(6, Math.round(w / 9))
-    for (let i = 0; i < cloudCount; i++) {
+    for (let i = 0; i < 14; i++) {
       this.cloudSpecs.push({
-        x: rng.range(-span * 0.5, span * 0.5),
-        y: rng.range(18, 52),
-        w: rng.range(w * 0.06, w * 0.17),
+        x: rng.range(0, CLOUD_PERIOD),
+        y: rng.range(16, 54),
+        w: rng.range(7, 20),
         h: rng.range(1.6, 4.4),
         dark: rng.next() < 0.4,
       })
     }
 
-    const duneSamples = 26
-    this.duneFarSpec = []
-    this.duneNearSpec = []
-    for (let i = 0; i < duneSamples; i++) {
-      this.duneFarSpec.push(rng.range(3.5, 9))
-      this.duneNearSpec.push(rng.range(2, 6))
+    this.duneFar = []
+    this.duneNear = []
+    for (let i = 0; i < 64; i++) {
+      this.duneFar.push(rng.range(3.5, 9))
+      this.duneNear.push(rng.range(2, 6))
     }
   }
 
-  /** Redraw only when something actually changed. */
-  private redraw(viewW: number, viewH: number): void {
-    const s = this.severity
-    const w = this.field.widthM
-    const span = w * 2.2
+  /** The world rect visible in a layer's own parallax space, plus margin. */
+  private visibleRect(camera: Camera, factor: number, viewW: number, viewH: number): Rect {
+    const halfW = viewW / (2 * camera.scale)
+    const halfH = viewH / (2 * camera.scale)
+    const cx = camera.x * factor
+    const cy = camera.y * factor
+    const m = Math.max(halfW, halfH) * 0.25 + 5
+    return { x0: cx - halfW - m, x1: cx + halfW + m, y0: cy - halfH - m, y1: cy + halfH + m }
+  }
 
-    // --- sky: flat horizontal bands, screen space ---
-    this.sky.clear()
+  update(camera: Camera, viewW: number, viewH: number): void {
+    // Redraw when the view actually changed. Backdrop geometry depends on the
+    // camera now, so a dirty flag alone is not enough.
+    const key =
+      `${camera.x.toFixed(2)}|${camera.y.toFixed(2)}|${camera.zoom.toFixed(4)}|` +
+      `${Math.round(viewW)}|${Math.round(viewH)}|${this.severity.toFixed(3)}|${this.field.widthM}`
+    if (this.dirty || key !== this.lastKey) {
+      this.redraw(camera, viewW, viewH)
+      this.lastKey = key
+      this.dirty = false
+    }
+    for (const layer of this.layers) {
+      camera.applyTo(layer.container, layer.factor, viewW, viewH)
+    }
+  }
+
+  private redraw(camera: Camera, viewW: number, viewH: number): void {
+    const s = this.severity
+
+    this.drawSky(viewW, viewH, s)
+    this.drawClouds(this.visibleRect(camera, 0.1, viewW, viewH), s)
+    this.drawSea(this.visibleRect(camera, 0.25, viewW, viewH), s)
+    this.drawDunes(
+      this.dunesFar,
+      this.duneFar,
+      this.visibleRect(camera, 0.45, viewW, viewH),
+      mix(PALETTE.farDune, s),
+      1,
+    )
+    this.drawDunes(
+      this.dunesNear,
+      this.duneNear,
+      this.visibleRect(camera, 0.7, viewW, viewH),
+      mix(PALETTE.nearDune, s),
+      1,
+    )
+    this.drawGround(this.visibleRect(camera, 1, viewW, viewH), s)
+  }
+
+  private drawSky(viewW: number, viewH: number, s: number): void {
+    const g = this.sky
+    g.clear()
     const bands = PALETTE.skyBands.length
     for (let i = 0; i < bands; i++) {
       const y = (viewH / bands) * i
-      this.sky.rect(0, y, viewW, viewH / bands + 1).fill(mix(PALETTE.skyBands[i]!, s))
+      g.rect(0, y, viewW, viewH / bands + 1).fill(mix(PALETTE.skyBands[i]!, s))
     }
-
-    // --- clouds ---
-    this.clouds.clear()
-    for (const c of this.cloudSpecs) {
-      const colour = mix(c.dark ? PALETTE.cloudDark : PALETTE.cloud, s)
-      const alpha = lerp(0.85, 1, s)
-      this.clouds
-        .roundRect(c.x - c.w * 0.5, c.y - c.h * 0.5, c.w, c.h, c.h * 0.5)
-        .fill({ color: colour, alpha })
-      this.clouds
-        .roundRect(c.x - c.w * 0.22, c.y - c.h * 0.1, c.w * 0.55, c.h * 1.35, c.h * 0.6)
-        .fill({ color: colour, alpha })
-    }
-
-    // --- distant sea band, sitting on the horizon ---
-    this.farSea.clear()
-    this.farSea.rect(-span * 0.5, -40, span, 40).fill(mix(PALETTE.farSea, s))
-    this.farSea.rect(-span * 0.5, -0.9, span, 1.6).fill(mix(PALETTE.nearSea, s))
-
-    // --- dune silhouettes ---
-    this.drawDunes(this.dunesFar, this.duneFarSpec, span, mix(PALETTE.farDune, s), 1.35)
-    this.drawDunes(this.dunesNear, this.duneNearSpec, span, mix(PALETTE.nearDune, s), 1)
-
-    // --- the actual ground, from the terrain polyline ---
-    this.drawGround(s)
-
-    this.dirty = false
   }
 
-  private drawDunes(g: Graphics, spec: number[], span: number, colour: number, scale: number): void {
+  private drawClouds(r: Rect, s: number): void {
+    const g = this.clouds
+    g.clear()
+    const k0 = Math.floor(r.x0 / CLOUD_PERIOD) - 1
+    const k1 = Math.ceil(r.x1 / CLOUD_PERIOD) + 1
+    const alpha = lerp(0.85, 1, s)
+
+    for (let k = k0; k <= k1; k++) {
+      const offset = k * CLOUD_PERIOD
+      for (const c of this.cloudSpecs) {
+        const x = c.x + offset
+        if (x < r.x0 - c.w || x > r.x1 + c.w) continue
+        if (c.y < r.y0 || c.y > r.y1) continue
+        const colour = mix(c.dark ? PALETTE.cloudDark : PALETTE.cloud, s)
+        g.roundRect(x - c.w * 0.5, c.y - c.h * 0.5, c.w, c.h, c.h * 0.5).fill({ color: colour, alpha })
+        g.roundRect(x - c.w * 0.22, c.y - c.h * 0.1, c.w * 0.55, c.h * 1.35, c.h * 0.6)
+          .fill({ color: colour, alpha })
+      }
+    }
+  }
+
+  /** Distant sea, filled from the horizon all the way down past the viewport. */
+  private drawSea(r: Rect, s: number): void {
+    const g = this.farSea
+    g.clear()
+    const top = SEA_HORIZON
+    if (r.y0 >= top) return
+    g.rect(r.x0, r.y0, r.x1 - r.x0, top - r.y0).fill(mix(PALETTE.farSea, s))
+    g.rect(r.x0, top - 0.6, r.x1 - r.x0, 1.2).fill(mix(PALETTE.nearSea, s))
+  }
+
+  private drawDunes(g: Graphics, spec: number[], r: Rect, colour: number, scale: number): void {
     g.clear()
     const n = spec.length
-    const step = span / (n - 1)
-    const pts: number[] = [-span * 0.5, -60]
-    for (let i = 0; i < n; i++) {
-      pts.push(-span * 0.5 + i * step, spec[i]! * scale)
+    const i0 = Math.floor(r.x0 / DUNE_STEP) - 1
+    const i1 = Math.ceil(r.x1 / DUNE_STEP) + 1
+
+    const pts: number[] = [i0 * DUNE_STEP, r.y0]
+    for (let i = i0; i <= i1; i++) {
+      // Wrap the index so the profile tiles instead of running out.
+      const h = spec[((i % n) + n) % n]!
+      pts.push(i * DUNE_STEP, h * scale)
     }
-    pts.push(span * 0.5, -60)
+    pts.push(i1 * DUNE_STEP, r.y0)
     g.poly(pts).fill(colour)
   }
 
-  private drawGround(s: number): void {
+  private drawGround(r: Rect, s: number): void {
     const t = this.field.terrain
     const g = this.ground
     g.clear()
 
-    const floor = t.minHeight - 30
-    const pts: number[] = [t.x0, floor]
+    // The ground spans the FIELD only. Extending it to the viewport would bury
+    // the distant sea and dunes behind it; beyond the field edges the backdrop
+    // layers are meant to show through.
+    const left = t.x0
+    const right = t.x1
+    const floor = Math.min(r.y0, t.minHeight - 5)
+
+    const pts: number[] = [left, floor, left, t.heightAt(t.x0)]
     for (let i = 0; i < t.heights.length; i++) {
       pts.push(t.x0 + i * t.spacing, t.heights[i]!)
     }
-    pts.push(t.x1, floor)
+    pts.push(right, t.heightAt(t.x1), right, floor)
     g.poly(pts).fill(mix(PALETTE.sand, s))
 
     // Everything below sea level reads as wet/submerged ground.
-    g.poly(pts).fill(mix(PALETTE.sand, s))
     const wet: number[] = []
     let started = false
     for (let i = 0; i < t.heights.length; i++) {
@@ -211,25 +297,11 @@ export class Scenery {
       }
     }
     if (started) wet.push(t.x1, 0)
-    if (wet.length >= 6) {
-      g.poly(wet).fill(mix(PALETTE.wetSand, s))
-    }
+    if (wet.length >= 6) g.poly(wet).fill(mix(PALETTE.wetSand, s))
 
-    // Field edges, so the authored width is always legible.
+    // Field edges, so the authored width stays legible.
     const top = t.maxHeight + 14
     g.rect(t.x0 - 0.25, floor, 0.5, top - floor).fill({ color: 0x000000, alpha: 0.22 })
     g.rect(t.x1 - 0.25, floor, 0.5, top - floor).fill({ color: 0x000000, alpha: 0.22 })
-  }
-
-  update(camera: Camera, viewW: number, viewH: number): void {
-    if (this.dirty) this.redraw(viewW, viewH)
-    for (const layer of this.layers) {
-      camera.applyTo(layer.container, layer.factor, viewW, viewH)
-    }
-  }
-
-  /** Force a redraw, e.g. after the viewport resizes. */
-  invalidate(): void {
-    this.dirty = true
   }
 }
