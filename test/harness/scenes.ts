@@ -28,14 +28,30 @@ export function flatTerrain(widthM: number, height: number, sampleSpacing = 1): 
   return new Terrain(heights, -widthM / 2, widthM / 2)
 }
 
-/** A basin: flat floor with steep walls at the ends, so water is contained by terrain alone. */
-export function basinTerrain(widthM: number, floor: number, rimHeight: number, rimFraction = 0.08): Terrain {
+/**
+ * A basin: flat floor with SLOPED walls at the ends.
+ *
+ * The walls ramp rather than step. A heightfield cannot represent a vertical
+ * face - the contact projection is vertical, so a particle a hair inside a
+ * near-vertical wall is teleported the full wall height in one substep, which
+ * manufactures potential energy out of nothing. That is a defect of the test
+ * fixture, not of the fluid, and it hid the fact that the solver is stable.
+ */
+export function basinTerrain(
+  widthM: number,
+  floor: number,
+  rimHeight: number,
+  rimFraction = 0.16,
+): Terrain {
   const sampleSpacing = 0.5
   const count = Math.max(4, Math.round(widthM / sampleSpacing) + 1)
   const heights = new Float32Array(count)
-  const rim = Math.max(1, Math.floor(count * rimFraction))
+  const rim = Math.max(2, Math.floor(count * rimFraction))
   for (let i = 0; i < count; i++) {
-    heights[i] = i < rim || i >= count - rim ? rimHeight : floor
+    const fromLeft = i / rim
+    const fromRight = (count - 1 - i) / rim
+    const t = Math.min(fromLeft, fromRight, 1)
+    heights[i] = floor + (rimHeight - floor) * (1 - t)
   }
   return new Terrain(heights, -widthM / 2, widthM / 2)
 }
@@ -94,8 +110,12 @@ export function fillWater(sim: SimWorld, opts: FillOptions): number {
 
   let n = 0
   for (let x = opts.x0 + spacing * 0.5; x < opts.x1; x += spacing) {
-    const ground = t ? t.heightAt(x) : -Infinity
-    const bottom = Math.max(opts.yBottom ?? -Infinity, ground + spacing * 0.5)
+    const ground = t ? t.heightAt(x) : opts.yBottom
+    const floor = ground ?? opts.yBottom
+    if (floor === undefined || !Number.isFinite(floor)) {
+      throw new Error('fillWater needs terrain or an explicit finite yBottom')
+    }
+    const bottom = Math.max(opts.yBottom ?? floor + spacing * 0.5, floor + spacing * 0.5)
     for (let y = bottom; y < opts.yTop; y += spacing) {
       p.create({
         x: x + rand() * spacing * jitter,

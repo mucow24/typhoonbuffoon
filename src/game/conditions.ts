@@ -121,8 +121,14 @@ export class Conditions {
         const y = ground + spacing * 0.5 + ring * spacing
         if (y > top) continue
 
+        const x = side.x + side.dir * ring * spacing * 0.15
+        // Never admit water where there is already water. Overlapping spawns
+        // produce a density error the solver can only answer with a violent
+        // correction, and that is what made raising the flood slider detonate.
+        if (this.sim.hasFluidNear(x, y, spacing * 0.85)) continue
+
         const i = p.create({
-          x: side.x + side.dir * ring * spacing * 0.15,
+          x,
           y,
           invMass: 1 / mass,
           radius: spacing * 0.5,

@@ -27,20 +27,21 @@ export class FluidSolver {
    */
   restDensity = 1000
   private calibratedFor = -1
-  /** Density projection iterations per projection pass. */
+  /** Density projection iterations per substep. */
   iterations = 1
-  /**
-   * Project on every Nth substep rather than all of them. Standard PBF runs
-   * 3-4 projections per frame; projecting on all 12 substeps was six times the
-   * work for no visible gain.
-   */
-  substepsPerProjection = 3
   /** Constraint force mixing, stops lambda blowing up in sparse regions. */
   relaxation = 1e-5
   /** XSPH viscosity. Higher is gloopier and calmer. */
   viscosity = 0.05
-  /** Per-iteration position correction cap, as a fraction of particle spacing. */
-  maxCorrectionFraction = 0.5
+  /**
+   * Cap on the VELOCITY a density correction may imply, m/s.
+   *
+   * Position corrections become velocity through (x - x_prev)/h, and h is a
+   * substep - about 1.4 ms. A cap expressed as a fraction of particle spacing
+   * therefore permits absurd speeds: 0.5 * 0.4 m over 1.4 ms is 144 m/s. The
+   * bound has to be stated in the units of the thing that actually goes wrong.
+   */
+  maxCorrectionSpeed = 1.5
   /** Artificial pressure - stops particles clumping into strings. */
   surfaceTensionK = 1e-4
   surfaceTensionN = 4
@@ -178,8 +179,8 @@ export class FluidSolver {
     }
   }
 
-  /** One density projection pass. Called on every Nth substep. */
-  project(p: ParticleStore): void {
+  /** One density projection pass. Called EVERY substep - see the note in solve order. */
+  project(p: ParticleStore, substepH: number): void {
     const live = this.liveCount
     if (live === 0) return
 
@@ -190,7 +191,7 @@ export class FluidSolver {
     const mass = this.particleMass
     const rho0 = this.restDensity
     const invRho0 = 1 / rho0
-    const maxCorr = this.maxCorrectionFraction * this.spacing
+    const maxCorr = this.maxCorrectionSpeed * substepH
     const stK = this.surfaceTensionK
 
     // sCorr reference value at 0.2h, for the artificial pressure term.

@@ -95,12 +95,22 @@ describe('hydrostatics', () => {
     fillWater(sim, { x0: -14, x1: -8, yTop: 8 })
     settle(sim, 20)
 
-    const uphill = surfaceProfile(sim, { x0: -14, x1: -8, columnWidth: 1 })
-    const downhill = surfaceProfile(sim, { x0: 6, x1: 13, columnWidth: 1 })
+    // Centre of mass, not wet-column counts: both ends can be equally wet while
+    // the water has not moved at all, which is how this assertion tied at 6.
+    const p = sim.particles
+    let sumX = 0
+    let n = 0
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== 1) continue
+      sumX += p.posX[i]!
+      n++
+    }
+    const centre = sumX / Math.max(n, 1)
 
-    // Water released high on a ramp ends up low on the ramp. Anything else is
-    // not obeying gravity.
-    expect(downhill.wetColumns).toBeGreaterThan(uphill.wetColumns)
+    // Released around x = -11 on a ramp falling to the right, the body of water
+    // has to end up downhill of where it started.
+    expect(n).toBeGreaterThan(20)
+    expect(centre).toBeGreaterThan(-9)
   })
 })
 

@@ -86,6 +86,12 @@ export class SimWorld {
   waterDensity = 1000
   /** Linear drag from submersion, per second. Stops floaters bobbing forever. */
   waterDrag = 2.2
+  /** Fraction of a contact penetration resolved per substep. */
+  contactRelaxation = 0.35
+  /** Hard cap on one substep's contact push, metres. */
+  maxContactCorrection = 0.05
+  /** Hard cap on one substep's terrain push, metres. */
+  maxTerrainPush = 0.35
   private contactStamp = new Int32Array(4096)
   private stampCounter = 0
   private readonly tmpVel = { x: 0, y: 0 }
@@ -118,7 +124,12 @@ export class SimWorld {
       for (const c of this.clusters) if (c.alive) c.solve(this.particles)
       this.bend.solve(this.particles, h)
       this.distance.solve(this.particles, h)
-      if (s % this.fluid.substepsPerProjection === 0) this.fluid.project(this.particles)
+      // EVERY substep. Projecting on every third one let density error build
+      // across two unpressurised substeps and then discharged it in a single
+      // correction, which (x - x_prev)/h turns into a velocity three times too
+      // large before the tiny substep h multiplies it again. Small steps only
+      // work when every step is corrected.
+      this.fluid.project(this.particles, h)
       this.solveFluidAgainstMembers()
       this.solveFluidAgainstObjects()
       this.solveContacts()
@@ -207,13 +218,37 @@ export class SimWorld {
       if (alive[i] !== 1 || p.invMass[i] === 0) continue
       const r = p.radius[i]!
 
-      if (p.posX[i]! < this.boundsX0 + r) p.posX[i] = this.boundsX0 + r
-      else if (p.posX[i]! > this.boundsX1 - r) p.posX[i] = this.boundsX1 - r
+      // Field edges are contacts too, and need the same prev carry as terrain.
+      // Snapping posX back inside without it makes every wall touch a velocity
+      // spike - which is why water admitted AT the edges detonated on arrival.
+      if (p.posX[i]! < this.boundsX0 + r) {
+        p.posX[i] = this.boundsX0 + r
+        p.prevX[i] = p.posX[i]!
+      } else if (p.posX[i]! > this.boundsX1 - r) {
+        p.posX[i] = this.boundsX1 - r
+        p.prevX[i] = p.posX[i]!
+      }
 
       if (t) {
         const floor = t.heightAt(p.posX[i]!) + r
         if (p.posY[i]! < floor) {
-          p.posY[i] = floor
+          // Resolve the penetration fully, but carry prevY along with it so the
+          // correction is never differentiated into velocity.
+          //
+          // The projection is vertical, so on steep ground - a basin wall, a
+          // cliff - a buried particle is moved metres in one 1.4 ms substep,
+          // and (pos - prev)/h reads that as hundreds of m/s. Easing the push
+          // instead just leaves particles buried and the terrain stops holding
+          // water. Moving prev with the correction gives the right thing: an
+          // inelastic contact, position resolved and normal velocity killed.
+          // Cap how far one substep may lift a particle, and carry prevY with
+          // it so the correction is never differentiated into velocity. Without
+          // the cap, steep ground teleports a buried particle metres upward and
+          // invents the potential energy to match; without the prev carry, the
+          // push reads as hundreds of m/s.
+          const push = Math.min(floor - p.posY[i]!, this.maxTerrainPush)
+          p.posY[i]! += push
+          p.prevY[i] = p.posY[i]!
           this.grounded[i] = 1
         }
       }
@@ -339,9 +374,32 @@ export class SimWorld {
             // field (buoyancy + drag). Doing both double-counts buoyancy, and
             // since a wood crate's particles are lighter than fluid particles
             // the collision term dominated and launched objects tens of metres.
-            const pen = minDist - dist
-            p.posX[j]! += nx * pen
-            p.posY[j]! += ny * pen
+            //
+            // Resolved over several substeps rather than in one jump: a full
+            // penetration of one particle spacing discharged in a single 1.4 ms
+            // substep is a 280 m/s impulse.
+            const pen = Math.min(minDist - dist, this.maxContactCorrection)
+            const push = pen * this.contactRelaxation
+            p.posX[j]! += nx * push
+            p.posY[j]! += ny * push
+
+            // Inelastic contact, done properly: resolve the position, then
+            // remove the INBOUND NORMAL component of motion while leaving the
+            // tangential part alone.
+            //
+            // Neither shortcut works. Leaving prev untouched differentiates the
+            // push into velocity - 0.05 m over a 1.4 ms substep is 36 m/s, a
+            // wall of spray every time anything enters the water. Carrying prev
+            // along with the push kills the spike but preserves the velocity
+            // driving the particle into the solid, so it burrows straight
+            // through and a flood wall leaks a third of its water.
+            const dx2 = p.posX[j]! - p.prevX[j]!
+            const dy2 = p.posY[j]! - p.prevY[j]!
+            const vn = dx2 * nx + dy2 * ny
+            if (vn < 0) {
+              p.prevX[j] = p.posX[j]! - (dx2 - vn * nx)
+              p.prevY[j] = p.posY[j]! - (dy2 - vn * ny)
+            }
           }
         }
       }
@@ -397,10 +455,29 @@ export class SimWorld {
               ny /= dist
             }
 
-            // One-way, for the same reason as the member pass above.
-            const pen = minDist - dist
-            p.posX[j]! += nx * pen
-            p.posY[j]! += ny * pen
+            // One-way, and relaxed, for the same reasons as the member pass.
+            const pen = Math.min(minDist - dist, this.maxContactCorrection)
+            const push = pen * this.contactRelaxation
+            p.posX[j]! += nx * push
+            p.posY[j]! += ny * push
+
+            // Inelastic contact, done properly: resolve the position, then
+            // remove the INBOUND NORMAL component of motion while leaving the
+            // tangential part alone.
+            //
+            // Neither shortcut works. Leaving prev untouched differentiates the
+            // push into velocity - 0.05 m over a 1.4 ms substep is 36 m/s, a
+            // wall of spray every time anything enters the water. Carrying prev
+            // along with the push kills the spike but preserves the velocity
+            // driving the particle into the solid, so it burrows straight
+            // through and a flood wall leaks a third of its water.
+            const dx2 = p.posX[j]! - p.prevX[j]!
+            const dy2 = p.posY[j]! - p.prevY[j]!
+            const vn = dx2 * nx + dy2 * ny
+            if (vn < 0) {
+              p.prevX[j] = p.posX[j]! - (dx2 - vn * nx)
+              p.prevY[j] = p.posY[j]! - (dy2 - vn * ny)
+            }
           }
         }
       }
@@ -494,6 +571,36 @@ export class SimWorld {
         p.accY[i]! += ((force * relY) / relSpeed) * p.invMass[i]!
       }
     }
+  }
+
+  /**
+   * Is there already fluid within `radius` of this point?
+   *
+   * Uses last frame's hash, which is plenty for deciding whether there is room
+   * to admit a particle. Spawning water into occupied space produces an
+   * enormous density error, and the correction that follows saturates the
+   * velocity clamp - the flood slider detonating on contact was exactly this.
+   */
+  hasFluidNear(x: number, y: number, radius: number): boolean {
+    const hash = this.fluid.hash
+    const starts = hash.starts
+    const entries = hash.entries
+    const scratch = hash.scratch
+    const p = this.particles
+    const r2 = radius * radius
+    const buckets = hash.collectBuckets(x, y)
+    for (let s = 0; s < buckets; s++) {
+      const b = scratch[s]!
+      const end = starts[b + 1]!
+      for (let k = starts[b]!; k < end; k++) {
+        const j = entries[k]!
+        if (p.slots.alive[j] !== 1 || p.kind[j] !== KIND_FLUID) continue
+        const dx = p.posX[j]! - x
+        const dy = p.posY[j]! - y
+        if (dx * dx + dy * dy < r2) return true
+      }
+    }
+    return false
   }
 
   /** Add a rectangular physics object. Returns its cluster. */
