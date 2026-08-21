@@ -4,6 +4,8 @@ import type { SimWorld } from '../sim/world'
 import type { Camera } from './camera'
 
 const TEX_SIZE = 32
+/** Somewhere no camera can reach. */
+const PARKED = 1e7
 
 /**
  * Fluid rendering via ParticleContainer.
@@ -54,9 +56,19 @@ export class FluidView {
     }
 
     // Park the surplus rather than reallocating the container every frame.
+    //
+    // Moved far out of the world AS WELL AS scaled to zero. Hiding by scale
+    // alone assumes the scale attribute is re-uploaded every frame; if the
+    // container treats it as static - written once when the particle is created
+    // - the assignment silently does nothing and the sprite stays wherever it
+    // was last drawn. That is what left a cloud of blue dots hanging over a map
+    // with no water left in it. Position is dynamic by necessity, so parking
+    // works whatever the container does with scale.
     for (let k = n; k < this.shown; k++) {
       const particle = this.pool[k]
       if (particle) {
+        particle.x = PARKED
+        particle.y = PARKED
         particle.scaleX = 0
         particle.scaleY = 0
       }
@@ -73,6 +85,8 @@ export class FluidView {
         anchorY: 0.5,
         tint: 0x4ea8d8,
         alpha: 0.92,
+        x: PARKED,
+        y: PARKED,
       })
       this.pool[index] = particle
       this.container.addParticle(particle)
