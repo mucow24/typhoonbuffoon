@@ -1,5 +1,5 @@
 import type { SimWorld } from '../../src/sim/world'
-import { energy, escapedCount, maxSpeed, surfaceProfile, waterVolume } from './probes'
+import { energy, escapedCount, maxSpeed, speedPercentile, surfaceProfile, waterVolume } from './probes'
 
 export interface TraceSample {
   t: number
@@ -7,6 +7,7 @@ export interface TraceSample {
   potential: number
   total: number
   maxSpeed: number
+  p99Speed: number
   waterVolume: number
   surfaceMean: number
   surfaceStdDev: number
@@ -113,6 +114,7 @@ export function run(sim: SimWorld, opts: RunOptions): Trace {
       potential: e.potential,
       total: e.total,
       maxSpeed: maxSpeed(sim),
+      p99Speed: speedPercentile(sim, 0.99),
       waterVolume: waterVolume(sim),
       surfaceMean: s.mean,
       surfaceStdDev: s.stdDev,

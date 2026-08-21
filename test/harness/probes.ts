@@ -64,6 +64,28 @@ export function maxSpeed(sim: SimWorld, kind?: number): number {
   return m
 }
 
+/**
+ * Speed at a percentile.
+ *
+ * "At rest" is a statement about the body of water, and max-of-N is dominated
+ * by whichever single particle is currently misbehaving - it gets worse as the
+ * particle count rises, for a pool that is objectively calmer. A percentile
+ * says what the assertion means. Keep a loose max bound alongside it so real
+ * launches still fail.
+ */
+export function speedPercentile(sim: SimWorld, fraction: number, kind?: number): number {
+  const p = sim.particles
+  const speeds: number[] = []
+  for (let i = 0; i < p.highWater; i++) {
+    if (p.slots.alive[i] !== 1) continue
+    if (kind !== undefined && p.kind[i] !== kind) continue
+    speeds.push(Math.hypot(p.velX[i]!, p.velY[i]!))
+  }
+  if (speeds.length === 0) return 0
+  speeds.sort((a, b) => a - b)
+  return speeds[Math.min(speeds.length - 1, Math.floor(speeds.length * fraction))]!
+}
+
 export function meanSpeed(sim: SimWorld, kind = KIND_FLUID): number {
   const p = sim.particles
   let sum = 0

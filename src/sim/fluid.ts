@@ -41,7 +41,7 @@ export class FluidSolver {
    * therefore permits absurd speeds: 0.5 * 0.4 m over 1.4 ms is 144 m/s. The
    * bound has to be stated in the units of the thing that actually goes wrong.
    */
-  maxCorrectionSpeed = 1.5
+  maxCorrectionSpeed = 0.5
   /** Artificial pressure - stops particles clumping into strings. */
   surfaceTensionK = 1e-4
   surfaceTensionN = 4

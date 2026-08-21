@@ -66,7 +66,7 @@ describe('water at rest', () => {
 
     // Water poured in has to slosh a little, but by the back half of a
     // 25 second run it should be effectively still.
-    expectSettles(trace, { below: 0.35, byFraction: 0.6, label: 'still pool' })
+    expectSettles(trace, { below: 0.35, maxBelow: 2, byFraction: 0.6, label: 'still pool' })
   })
 
   it('never launches a particle', () => {

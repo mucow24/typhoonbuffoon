@@ -253,9 +253,30 @@ export class SimWorld {
           // the cap, steep ground teleports a buried particle metres upward and
           // invents the potential energy to match; without the prev carry, the
           // push reads as hundreds of m/s.
-          const push = Math.min(floor - p.posY[i]!, this.maxTerrainPush)
-          p.posY[i]! += push
-          p.prevY[i] = p.posY[i]!
+          // Push ALONG THE NORMAL, not straight up. For a heightfield the
+          // distance to the surface along the normal is the vertical gap times
+          // ny, so a vertical push overshoots on any slope - and repeatedly
+          // overshooting at the foot of a bank is what kept flicking particles
+          // out of an otherwise still pool.
+          const nrm = t.normalAt(p.posX[i]!)
+          const gap = Math.min(floor - p.posY[i]!, this.maxTerrainPush)
+          const d = gap * nrm.ny
+          p.posX[i]! += nrm.nx * d
+          p.posY[i]! += nrm.ny * d
+          p.prevX[i]! += nrm.nx * d
+          p.prevY[i]! += nrm.ny * d
+
+          // Remove the velocity going INTO the surface and leave the along
+          // slope part alone. Zeroing the whole vertical component instead is a
+          // discontinuity on any slope: it destroys downhill motion as well as
+          // impact.
+          const rx = p.posX[i]! - p.prevX[i]!
+          const ry = p.posY[i]! - p.prevY[i]!
+          const vn = rx * nrm.nx + ry * nrm.ny
+          if (vn < 0) {
+            p.prevX[i] = p.posX[i]! - (rx - vn * nrm.nx)
+            p.prevY[i] = p.posY[i]! - (ry - vn * nrm.ny)
+          }
           this.grounded[i] = 1
         }
       }

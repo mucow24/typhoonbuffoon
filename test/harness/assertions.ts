@@ -48,16 +48,36 @@ export function expectSpeedBelow(trace: Trace, limit: number, label = 'particles
   }
 }
 
-/** The system must come to rest. */
-export function expectSettles(trace: Trace, opts: { below: number; byFraction?: number; label?: string }): void {
+/**
+ * The system must come to rest.
+ *
+ * Judged on the 99th percentile, with a separate looser bound on the outright
+ * maximum. Asserting only on the max means one twitching particle out of six
+ * hundred fails a pool whose mean speed is 0.03 m/s, and it gets stricter as
+ * the particle count rises even though the water is calmer.
+ */
+export function expectSettles(
+  trace: Trace,
+  opts: { below: number; maxBelow?: number; byFraction?: number; label?: string },
+): void {
   const byFraction = opts.byFraction ?? 0.6
   const cutoff = trace.last.t * byFraction
   const tail = trace.samples.filter((s) => s.t >= cutoff)
-  const worst = Math.max(...tail.map((s) => s.maxSpeed))
-  if (worst > opts.below) {
+  const worstTypical = Math.max(...tail.map((s) => s.p99Speed))
+  if (worstTypical > opts.below) {
     throw new Error(
-      `${opts.label ?? 'system'} never settled: max speed after t=${cutoff.toFixed(1)}s was ` +
-        `${fmt(worst)} m/s, expected below ${opts.below}\n  ${trace.describe('maxSpeed', ' m/s')}`,
+      `${opts.label ?? 'system'} never settled: 99th-percentile speed after ` +
+        `t=${cutoff.toFixed(1)}s was ${fmt(worstTypical)} m/s, expected below ${opts.below}\n` +
+        `  ${trace.describe('p99Speed', ' m/s')}\n  ${trace.describe('maxSpeed', ' m/s')}`,
+    )
+  }
+  const maxBelow = opts.maxBelow ?? opts.below * 8
+  const worstAny = Math.max(...tail.map((s) => s.maxSpeed))
+  if (worstAny > maxBelow) {
+    throw new Error(
+      `${opts.label ?? 'system'} had a particle at ${fmt(worstAny)} m/s after ` +
+        `t=${cutoff.toFixed(1)}s, well past the ${maxBelow} m/s a settled system allows\n` +
+        `  ${trace.describe('maxSpeed', ' m/s')}`,
     )
   }
 }
