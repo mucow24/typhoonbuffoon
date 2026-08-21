@@ -5,10 +5,10 @@ import { createRenderer, type Renderer } from './render/app'
 import { Camera } from './render/camera'
 import { Scenery } from './render/scenery'
 import { SimView } from './render/simView'
-import { buildChain } from './scenes/demos'
+import { buildBeam, buildChain } from './scenes/demos'
 import { SimWorld } from './sim/world'
 import { DebugOverlay } from './ui/debug'
-import { NumberField, Panel, Slider, button } from './ui/controls'
+import { Choice, NumberField, Panel, Slider, button } from './ui/controls'
 import { Field } from './world/field'
 
 /**
@@ -27,9 +27,13 @@ export class Game {
   readonly sim: SimWorld
   readonly simView: SimView
 
-  /** Tuning state for the step 3 probe scene. */
+  /** Tuning state for the probe scenes. */
   private probeCompliance = 1e-7
   private probeZeta = 0.9
+  private flexEI = 4e6
+  private bendZeta = 0.9
+  private segments = 6
+  private sceneName: 'cantilever' | 'palm' | 'chain' = 'cantilever'
 
   private constructor(renderer: Renderer) {
     this.renderer = renderer
@@ -75,6 +79,7 @@ export class Game {
       .add('zoom', () => `${this.camera.zoom.toFixed(2)}x`)
       .add('particles', () => String(this.sim.particles.count))
       .add('constraints', () => String(this.sim.distance.count))
+      .add('bends', () => String(this.sim.bend.count))
   }
 
   static async create(): Promise<Game> {
@@ -111,6 +116,18 @@ export class Game {
     panel.root.style.top = '150px'
 
     new Slider(panel.body, {
+      label: 'global damping',
+      min: 0,
+      max: 2,
+      step: 0.05,
+      value: this.sim.linearDamping,
+      format: (v) => `${v.toFixed(2)}/s`,
+      onInput: (v) => {
+        this.sim.linearDamping = v
+      },
+    })
+
+    new Slider(panel.body, {
       label: 'substeps',
       min: 1,
       max: 32,
@@ -137,7 +154,7 @@ export class Game {
     })
 
     new Slider(panel.body, {
-      label: 'damping zeta',
+      label: 'axial zeta',
       min: 0,
       max: 2,
       step: 0.05,
@@ -149,22 +166,106 @@ export class Game {
       },
     })
 
+    panel.section('bending')
+
+    // Flexural rigidity rather than raw compliance: the joint compliance is
+    // derived as segmentLength/EI, so the material keeps its meaning when the
+    // segment count changes.
+    new Slider(panel.body, {
+      label: 'stiffness EI',
+      min: 5,
+      max: 8.5,
+      step: 0.1,
+      value: Math.log10(this.flexEI),
+      format: (v) => `1e${v.toFixed(1)}`,
+      onInput: (v) => {
+        this.flexEI = Math.pow(10, v)
+        this.rebuildScene()
+      },
+    })
+
+    new Slider(panel.body, {
+      label: 'bend zeta',
+      min: 0,
+      max: 2,
+      step: 0.05,
+      value: this.bendZeta,
+      format: (v) => v.toFixed(2),
+      onInput: (v) => {
+        this.bendZeta = v
+        this.sim.bend.zeta.fill(v, 0, this.sim.bend.highWater)
+      },
+    })
+
+    new Slider(panel.body, {
+      label: 'segments',
+      min: 1,
+      max: 12,
+      step: 1,
+      value: this.segments,
+      format: (v) => v.toFixed(0),
+      onInput: (v) => {
+        this.segments = v
+        this.rebuildScene()
+      },
+    })
+
+    panel.section('scene')
+
+    new Choice(panel.body, {
+      label: 'probe',
+      value: this.sceneName,
+      options: [
+        { value: 'cantilever', label: 'cantilever' },
+        { value: 'palm', label: 'palm' },
+        { value: 'chain', label: 'chain' },
+      ],
+      onChange: (v) => {
+        this.sceneName = v
+        this.rebuildScene()
+      },
+    })
+
     button(panel.body, 'reset scene', () => this.rebuildScene())
-    panel.note('step 3 probe: hanging chain')
   }
 
   /** Rebuild the sim from scratch. Cheap, and keeps reset honest. */
   rebuildScene(): void {
     this.sim.clear()
     const t = this.field.terrain
-    buildChain(this.sim, {
-      x: t.x0 + this.field.widthM * 0.18,
-      y: t.maxHeight + 16,
-      links: 14,
-      spacing: 0.9,
-      compliance: this.probeCompliance,
-      zeta: this.probeZeta,
-    })
+    const x = t.x0 + this.field.widthM * 0.22
+    const common = {
+      segments: this.segments,
+      axialCompliance: this.probeCompliance,
+      flexuralRigidity: this.flexEI,
+      zetaAxial: this.probeZeta,
+      zetaBend: this.bendZeta,
+    }
+
+    switch (this.sceneName) {
+      case 'chain':
+        buildChain(this.sim, {
+          x,
+          y: t.maxHeight + 16,
+          links: 14,
+          spacing: 0.9,
+          compliance: this.probeCompliance,
+          zeta: this.probeZeta,
+        })
+        break
+
+      case 'cantilever': {
+        const y = t.heightAt(x) + 14
+        buildBeam(this.sim, { ...common, x0: x, y0: y, x1: x + 12, y1: y, clampStart: true })
+        break
+      }
+
+      case 'palm': {
+        const y = t.heightAt(x)
+        buildBeam(this.sim, { ...common, x0: x, y0: y, x1: x, y1: y + 13, clampStart: true })
+        break
+      }
+    }
   }
 
   private fixedUpdate(dt: number): void {
