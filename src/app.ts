@@ -4,6 +4,7 @@ import { CameraController } from './input/cameraController'
 import { createRenderer, type Renderer } from './render/app'
 import { Camera } from './render/camera'
 import { Scenery } from './render/scenery'
+import { FluidView } from './render/fluidView'
 import { SimView } from './render/simView'
 import { buildBeam, buildChain, buildLoadTest } from './scenes/demos'
 import { materialAt, type MaterialId } from './sim/materials'
@@ -29,6 +30,7 @@ export class Game {
   readonly cameraController: CameraController
   readonly sim: SimWorld
   readonly simView: SimView
+  readonly fluidView: FluidView
 
   materialId: MaterialId = 'wood'
   segments = 0 // 0 means derive from the material
@@ -48,11 +50,14 @@ export class Game {
     this.sim = new SimWorld()
     this.sim.terrain = this.field.terrain
     this.simView = new SimView(renderer.world, this.sim)
+    this.fluidView = new FluidView(renderer.world, renderer.app.renderer, this.sim)
+    this.syncBounds()
 
     this.cameraController = new CameraController(this.camera, renderer.app.canvas, renderer)
 
     this.field.onChange(() => {
       this.sim.terrain = this.field.terrain
+      this.syncBounds()
       this.rebuildScene()
     })
 
@@ -65,6 +70,7 @@ export class Game {
     this.buildFieldPanel()
     this.buildSolverPanel()
     this.buildScenePanel()
+    this.buildWaterPanel()
     this.rebuildScene()
 
     this.loop = new GameLoop({
@@ -86,6 +92,7 @@ export class Game {
       .add('peak load', () => `${(this.peakLoad() * 100).toFixed(0)}%`)
       .add('max damage', () => `${(this.maxDamage() * 100).toFixed(0)}%`)
       .add('broken', () => String(this.breakCount))
+      .add('water', () => String(this.sim.fluidCount))
   }
 
   static async create(): Promise<Game> {
@@ -112,6 +119,63 @@ export class Game {
       if (d.slots.alive[i] === 1) peak = Math.max(peak, d.damage[i]!)
     }
     return peak
+  }
+
+  private syncBounds(): void {
+    this.sim.boundsX0 = this.field.left
+    this.sim.boundsX1 = this.field.right
+  }
+
+  private buildWaterPanel(): void {
+    const panel = new Panel({ title: 'water', side: 'right', width: 200 })
+    panel.root.style.top = '320px'
+
+    // Resolution is a control rather than a constant: field width is unclamped
+    // and flood depth is up to 20 m, so spacing is the lever that keeps the
+    // particle count affordable. Deliberately not clamped - see docs/PLAN.md 8.
+    new Slider(panel.body, {
+      label: 'resolution',
+      min: 0.1,
+      max: 1.5,
+      step: 0.05,
+      value: this.sim.fluid.spacing,
+      format: (v) => `${v.toFixed(2)} m`,
+      onInput: (v) => {
+        this.sim.fluid.spacing = v
+      },
+    })
+
+    new Slider(panel.body, {
+      label: 'viscosity',
+      min: 0,
+      max: 0.4,
+      step: 0.01,
+      value: this.sim.fluid.viscosity,
+      format: (v) => v.toFixed(2),
+      onInput: (v) => {
+        this.sim.fluid.viscosity = v
+      },
+    })
+
+    new Slider(panel.body, {
+      label: 'fluid iters',
+      min: 1,
+      max: 6,
+      step: 1,
+      value: this.sim.fluid.iterations,
+      format: (v) => v.toFixed(0),
+      onInput: (v) => {
+        this.sim.fluid.iterations = v
+      },
+    })
+
+    button(panel.body, 'dump water', () => {
+      const t = this.field.terrain
+      const x = this.camera.x
+      this.sim.spawnBlock(x, t.heightAt(x) + 14, 10, 8)
+    })
+
+    button(panel.body, 'clear water', () => this.sim.clearFluid())
   }
 
   private fitView(): void {
@@ -293,6 +357,7 @@ export class Game {
   private render(_alpha: number): void {
     this.scenery.update(this.camera, this.renderer.width, this.renderer.height)
     this.simView.update(this.camera, this.renderer.width, this.renderer.height)
+    this.fluidView.update(this.camera, this.renderer.width, this.renderer.height)
     this.renderer.app.render()
     this.hud.update()
   }
