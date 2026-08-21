@@ -7,13 +7,16 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run"
   },
   "dependencies": {
     "pixi.js": "^8.20.0"
   },
   "devDependencies": {
     "typescript": "^7.0.2",
-    "vite": "^8.2.2"
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
   }
 }

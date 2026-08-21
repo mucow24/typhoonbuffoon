@@ -46,7 +46,8 @@ export class FluidSolver {
   surfaceTensionN = 4
 
   readonly hash = new SpatialHash()
-  private density = new Float32Array(0)
+  /** Public so the physics harness can measure compression. Read-only in practice. */
+  density = new Float32Array(0)
   private lambda = new Float32Array(0)
   private dpx = new Float32Array(0)
   private dpy = new Float32Array(0)
@@ -57,7 +58,8 @@ export class FluidSolver {
   /** particle index -> slot in `indices`. Flat array, not a map: this is read
    *  once per neighbour pair per iteration, which is ~1M lookups a frame. */
   private slot = new Int32Array(0)
-  private liveCount = 0
+  /** Number of live fluid particles in `density`/`lambda`, for the harness. */
+  liveCount = 0
 
   /** Smoothing radius. Two particle spacings gives ~12 neighbours in 2D. */
   get h(): number {
