@@ -4,6 +4,7 @@ import { DistanceConstraints } from './constraints/distance'
 import { Cluster, buildObject, type ObjectSpec } from './clusters'
 import { FluidSolver } from './fluid'
 import { WaterField } from './water'
+import { AIR_DENSITY, WindField } from './wind'
 import { materialAt } from './materials'
 import { KIND_FLUID, ParticleStore } from './particles'
 import { Rng } from '../core/rng'
@@ -38,6 +39,7 @@ export class SimWorld {
   readonly bend = new BendConstraints(2048)
   readonly fluid = new FluidSolver()
   readonly water = new WaterField()
+  readonly wind = new WindField()
   readonly clusters: Cluster[] = []
 
   gravity = -9.81
@@ -97,6 +99,8 @@ export class SimWorld {
       this.fluid.spacing * this.fluid.spacing,
     )
     this.applyBuoyancy()
+    this.wind.advance(dt)
+    this.applyWind()
     this.fluid.beginFrame(this.particles)
     for (let s = 0; s < this.substeps; s++) {
       this.predict(h)
@@ -393,6 +397,95 @@ export class SimWorld {
             p.posY[j]! += ny * pen
           }
         }
+      }
+    }
+  }
+
+  /**
+   * Wind drag, applied once per frame into the acceleration accumulators.
+   *
+   * Members are treated as segments and loaded by their frontal length - the
+   * projection of the segment perpendicular to the wind, plus its thickness.
+   * That makes a broadside wall catch far more wind than an edge-on strut, and
+   * because the force is split between the two endpoints it produces torque
+   * about the member naturally rather than needing a separate moment term.
+   *
+   * Frontal length comes from REST geometry: computing it from the deformed
+   * shape is the same runaway as buoyancy from deformed volume.
+   */
+  private applyWind(): void {
+    if (this.wind.baseSpeed <= 0) return
+    const p = this.particles
+    const d = this.distance
+    const alive = d.slots.alive
+    const half = 0.5 * AIR_DENSITY
+
+    for (let m = 0; m < d.highWater; m++) {
+      if (alive[m] !== 1) continue
+      const ia = d.a[m]!
+      const ib = d.b[m]!
+      const wa = p.invMass[ia]!
+      const wb = p.invMass[ib]!
+      if (wa === 0 && wb === 0) continue
+
+      const mat = materialAt(d.material[m]!)
+      const rest = d.rest[m]!
+      const ex = p.posX[ib]! - p.posX[ia]!
+      const ey = p.posY[ib]! - p.posY[ia]!
+      const len = Math.sqrt(ex * ex + ey * ey)
+      if (len < 1e-9) continue
+
+      const midX = (p.posX[ia]! + p.posX[ib]!) * 0.5
+      const midY = (p.posY[ia]! + p.posY[ib]!) * 0.5
+
+      // Submerged members are shielded from wind; the water has them instead.
+      const submerged = this.water.submergedFraction(midX, midY, mat.section * 0.5)
+      const exposure = 1 - submerged
+      if (exposure <= 0.01) continue
+
+      const windU = this.wind.velocityAt(midX)
+      const relX = windU - (p.velX[ia]! + p.velX[ib]!) * 0.5
+      const relY = -(p.velY[ia]! + p.velY[ib]!) * 0.5
+      const relSpeed = Math.sqrt(relX * relX + relY * relY)
+      if (relSpeed < 1e-6) continue
+
+      // Frontal length: the segment projected across the flow, from rest
+      // length, plus the member's own thickness.
+      const dirX = relX / relSpeed
+      const dirY = relY / relSpeed
+      const cross = Math.abs((ex * dirY - ey * dirX) / len)
+      const frontal = rest * cross + mat.section
+
+      const force = half * mat.dragCoefficient * frontal * relSpeed * relSpeed * exposure
+      const fx = force * dirX
+      const fy = force * dirY
+
+      // Split evenly; each endpoint converts to acceleration by its own mass.
+      if (wa > 0) {
+        p.accX[ia]! += fx * 0.5 * wa
+        p.accY[ia]! += fy * 0.5 * wa
+      }
+      if (wb > 0) {
+        p.accX[ib]! += fx * 0.5 * wb
+        p.accY[ib]! += fy * 0.5 * wb
+      }
+    }
+
+    // Objects: frontal length is the particle's own width.
+    for (const c of this.clusters) {
+      if (!c.alive) continue
+      for (let k = 0; k < c.particles.length; k++) {
+        const i = c.particles[k]!
+        if (p.slots.alive[i] !== 1 || p.invMass[i] === 0) continue
+        const exposure = 1 - this.water.submergedFraction(p.posX[i]!, p.posY[i]!, p.radius[i]!)
+        if (exposure <= 0.01) continue
+        const relX = this.wind.velocityAt(p.posX[i]!) - p.velX[i]!
+        const relY = -p.velY[i]!
+        const relSpeed = Math.sqrt(relX * relX + relY * relY)
+        if (relSpeed < 1e-6) continue
+        const force = half * 1.2 * (2 * p.radius[i]!) * relSpeed * relSpeed * exposure
+        p.accX[i]! += ((force * relX) / relSpeed) * p.invMass[i]!
+        p.accY[i]! += ((force * relY) / relSpeed) * p.invMass[i]!
       }
     }
   }

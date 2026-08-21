@@ -40,6 +40,8 @@ export interface Material {
   /** Damage accumulated per second at full load. */
   damageRate: number
   colour: number
+  /** Drag coefficient against wind. ~1.2 for a squarish section. */
+  dragCoefficient: number
   /** Default segment count for a member of this material, per metre of length. */
   segmentsPerMetre: number
 }
@@ -63,6 +65,7 @@ export const MATERIALS: Record<MaterialId, Material> = {
     damageOnset: 0.6,
     damageRate: 0.35,
     colour: 0xd8b478,
+    dragCoefficient: 1.3,
     segmentsPerMetre: 0.5,
   },
   steel: {
@@ -81,6 +84,7 @@ export const MATERIALS: Record<MaterialId, Material> = {
     damageOnset: 0.5,
     damageRate: 0.25,
     colour: 0x9aa7b4,
+    dragCoefficient: 1.1,
     segmentsPerMetre: 0.35,
   },
 }

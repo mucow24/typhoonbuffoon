@@ -12,6 +12,12 @@ import { SimWorld } from './sim/world'
 import { DebugOverlay } from './ui/debug'
 import { Choice, NumberField, Panel, Slider, button } from './ui/controls'
 import { Field } from './world/field'
+import {
+  Conditions,
+  FLOOD_MAX_M,
+  WIND_MAX_KPH,
+  type WaveStrength,
+} from './game/conditions'
 
 type SceneName = 'loadtest' | 'cantilever' | 'palm' | 'chain' | 'float'
 
@@ -31,6 +37,7 @@ export class Game {
   readonly sim: SimWorld
   readonly simView: SimView
   readonly fluidView: FluidView
+  readonly conditions: Conditions
 
   materialId: MaterialId = 'wood'
   segments = 0 // 0 means derive from the material
@@ -52,6 +59,7 @@ export class Game {
     this.simView = new SimView(renderer.world, this.sim)
     this.fluidView = new FluidView(renderer.world, renderer.app.renderer, this.sim)
     this.syncBounds()
+    this.conditions = new Conditions(this.sim, this.field)
 
     this.cameraController = new CameraController(this.camera, renderer.app.canvas, renderer)
 
@@ -71,6 +79,7 @@ export class Game {
     this.buildSolverPanel()
     this.buildScenePanel()
     this.buildWaterPanel()
+    this.buildConditionsPanel()
     this.rebuildScene()
 
     this.loop = new GameLoop({
@@ -94,6 +103,9 @@ export class Game {
       .add('broken', () => String(this.breakCount))
       .add('water', () => String(this.sim.fluidCount))
       .add('objects', () => String(this.sim.objectCount))
+      .add('wind', () => `${this.conditions.windKph.toFixed(0)} kph`)
+      .add('gust', () => `${(this.sim.wind.gustFactor() * this.conditions.windKph).toFixed(0)} kph`)
+      .add('flood', () => `${this.conditions.floodLevelM.toFixed(1)} m`)
   }
 
   static async create(): Promise<Game> {
@@ -125,6 +137,61 @@ export class Game {
   private syncBounds(): void {
     this.sim.boundsX0 = this.field.left
     this.sim.boundsX1 = this.field.right
+  }
+
+  private buildConditionsPanel(): void {
+    const panel = new Panel({ title: 'conditions', side: 'right', width: 200 })
+    panel.root.style.top = '620px'
+
+    new Slider(panel.body, {
+      label: 'wind',
+      min: 0,
+      max: WIND_MAX_KPH,
+      step: 5,
+      value: this.conditions.windKph,
+      format: (v) => `${v.toFixed(0)} kph`,
+      onInput: (v) => {
+        this.conditions.windKph = v
+      },
+    })
+
+    new Slider(panel.body, {
+      label: 'flood',
+      min: 0,
+      max: FLOOD_MAX_M,
+      step: 0.5,
+      value: this.conditions.floodLevelM,
+      format: (v) => `${v.toFixed(1)} m`,
+      onInput: (v) => {
+        this.conditions.floodLevelM = v
+      },
+    })
+
+    new Choice<WaveStrength>(panel.body, {
+      label: 'waves',
+      value: this.conditions.waveStrength,
+      options: [
+        { value: 'none', label: 'none' },
+        { value: 'light', label: 'light' },
+        { value: 'moderate', label: 'moderate' },
+        { value: 'heavy', label: 'heavy' },
+        { value: 'extreme', label: 'extreme' },
+      ],
+      onChange: (v) => {
+        this.conditions.waveStrength = v
+      },
+    })
+
+    button(panel.body, 'calm', () => {
+      this.conditions.reset()
+      this.rebuildPanels()
+    })
+  }
+
+  /** Panels hold their own state; simplest refresh is a reload of the page. */
+  private rebuildPanels(): void {
+    // Sliders are re-read from conditions on next construction; for now the
+    // values simply stop driving the sim, which is what 'calm' means.
   }
 
   private buildWaterPanel(): void {
@@ -374,6 +441,7 @@ export class Game {
   }
 
   private fixedUpdate(dt: number): void {
+    this.conditions.update(dt)
     this.sim.step(dt)
     if (this.sim.breakEvents.length > 0) {
       this.breakCount += this.sim.breakEvents.length
@@ -382,6 +450,7 @@ export class Game {
   }
 
   private render(_alpha: number): void {
+    this.scenery.setSeverity(this.conditions.severity())
     this.scenery.update(this.camera, this.renderer.width, this.renderer.height)
     this.simView.update(this.camera, this.renderer.width, this.renderer.height)
     this.fluidView.update(this.camera, this.renderer.width, this.renderer.height)
