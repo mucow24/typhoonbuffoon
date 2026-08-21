@@ -100,6 +100,19 @@ export class SimWorld {
   private contactStamp = new Int32Array(4096)
   private stampCounter = 0
   private readonly tmpVel = { x: 0, y: 0 }
+  /**
+   * Derive FLUID velocity across the whole frame instead of per substep.
+   *
+   * PBF derives velocity as (x - x_prev)/dt over one timestep. Substepping it
+   * and dividing by h instead amplifies ordinary SPH density noise by the
+   * substep count: a correction of 1% of particle spacing is 0.23 m/s over a
+   * frame and 2.8 m/s over a 1.4 ms substep. That is the perpetual churn - the
+   * pool is not unstable, it is being handed twelve times the velocity the
+   * algorithm intends.
+   */
+  fluidVelocityPerFrame = true
+  private frameX = new Float32Array(4096)
+  private frameY = new Float32Array(4096)
 
   step(dt: number): void {
     const h = dt / this.substeps
@@ -109,6 +122,7 @@ export class SimWorld {
       this.boundsX1,
       this.fluid.spacing * this.fluid.spacing,
     )
+    this.captureFrameStart()
     this.applyBuoyancy()
     this.wind.advance(dt)
     this.applyWind()
@@ -144,9 +158,46 @@ export class SimWorld {
       this.bend.dampVelocities(this.particles, h)
       this.distance.dampVelocities(this.particles, h)
     }
+    this.deriveFluidVelocity(dt)
     this.fluid.applyViscosity(this.particles)
     this.clearAccelerations()
     this.updateDamage(dt)
+  }
+
+  private captureFrameStart(): void {
+    if (!this.fluidVelocityPerFrame) return
+    const p = this.particles
+    const n = p.highWater
+    if (this.frameX.length < n) {
+      this.frameX = new Float32Array(Math.max(n, 4096))
+      this.frameY = new Float32Array(Math.max(n, 4096))
+    }
+    for (let i = 0; i < n; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_FLUID) continue
+      this.frameX[i] = p.posX[i]!
+      this.frameY[i] = p.posY[i]!
+    }
+  }
+
+  private deriveFluidVelocity(dt: number): void {
+    if (!this.fluidVelocityPerFrame) return
+    const p = this.particles
+    const n = p.highWater
+    const invDt = 1 / dt
+    const maxSpeed2 = this.maxSpeed * this.maxSpeed
+    for (let i = 0; i < n; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_FLUID || p.invMass[i] === 0) continue
+      let vx = (p.posX[i]! - this.frameX[i]!) * invDt
+      let vy = (p.posY[i]! - this.frameY[i]!) * invDt
+      const sp2 = vx * vx + vy * vy
+      if (sp2 > maxSpeed2) {
+        const k = this.maxSpeed / Math.sqrt(sp2)
+        vx *= k
+        vy *= k
+      }
+      p.velX[i] = vx
+      p.velY[i] = vy
+    }
   }
 
   private predict(h: number): void {
