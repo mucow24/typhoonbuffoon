@@ -89,10 +89,12 @@ export class Game {
     renderer.app.renderer.on('resize', () => this.scenery.invalidate())
 
     this.hud = new DebugOverlay()
-    this.buildBuildPanel()
-    this.buildFieldPanel()
-    this.buildConditionsPanel()
-    this.buildSolverPanel()
+    const buildPanel = this.buildBuildPanel()
+    const fieldPanel = this.buildFieldPanel()
+    fieldPanel.below(buildPanel)
+    const conditionsPanel = this.buildConditionsPanel()
+    conditionsPanel.below(this.hud.panel)
+    this.buildSolverPanel().below(conditionsPanel)
 
     this.seedStarterLevel()
 
@@ -181,7 +183,7 @@ export class Game {
 
   // ------------------------------------------------------------------ panels
 
-  private buildBuildPanel(): void {
+  private buildBuildPanel(): Panel {
     const panel = new Panel({ title: 'build', side: 'left', width: 215 })
 
     this.toolChoice = new Choice<ToolName>(panel.body, {
@@ -240,11 +242,11 @@ export class Game {
     button(panel.body, 'save level + build', () => this.saveToDisk())
     button(panel.body, 'load level + build', () => this.loadFromDisk())
     button(panel.body, 'clear everything', () => this.session.clearAll())
+    return panel
   }
 
-  private buildFieldPanel(): void {
-    const panel = new Panel({ title: 'field', side: 'left', width: 215 })
-    panel.root.style.top = '430px'
+  private buildFieldPanel(): Panel {
+    const panel = new Panel({ title: 'field', side: 'left', width: 215, collapsed: true })
 
     new NumberField(panel.body, {
       label: 'width',
@@ -265,11 +267,11 @@ export class Game {
     button(panel.body, 'palm', () => this.loadProbe('palm'))
 
     panel.note('middle-drag or space-drag to pan')
+    return panel
   }
 
-  private buildConditionsPanel(): void {
+  private buildConditionsPanel(): Panel {
     const panel = new Panel({ title: 'conditions', side: 'right', width: 205 })
-    panel.root.style.top = '330px'
 
     new Slider(panel.body, {
       label: 'wind',
@@ -332,11 +334,11 @@ export class Game {
       this.conditions.reset()
       this.sim.clearFluid()
     })
+    return panel
   }
 
-  private buildSolverPanel(): void {
+  private buildSolverPanel(): Panel {
     const panel = new Panel({ title: 'solver', side: 'right', width: 205, collapsed: true })
-    panel.root.style.top = '690px'
 
     new Slider(panel.body, {
       label: 'substeps',
@@ -380,6 +382,7 @@ export class Game {
     toggle(panel.body, 'show nodes', this.simView.showNodes, (v) => {
       this.simView.showNodes = v
     })
+    return panel
   }
 
   // ------------------------------------------------------------------ probes

@@ -23,7 +23,14 @@ export const WAVE_LEVELS: Record<WaveStrength, number> = {
 export class Conditions {
   /** 0-250 kph. 250 is roughly a category 5. */
   windKph = 0
-  /** Target water level in metres. Water rolls in from the field edges. */
+  /**
+   * Target water level in metres. Water rolls in from the field edges.
+   *
+   * 0 means DRY, not sea level. The beach runs well below y=0, so treating 0 as
+   * sea level meant the map silently flooded itself with thousands of particles
+   * the moment it loaded. The distant ocean is scenery; actual simulated water
+   * is something you ask for.
+   */
   floodLevelM = 0
   waveStrength: WaveStrength = 'none'
 
@@ -59,6 +66,7 @@ export class Conditions {
    * one and the slider means the same thing on any map.
    */
   private targetParticleCount(): number {
+    if (this.floodLevelM <= 0) return 0
     const t = this.field.terrain
     const spacing = this.sim.fluid.spacing
     const step = spacing

@@ -1,6 +1,7 @@
 import { Container, Graphics } from 'pixi.js'
 import { clamp, lerp } from '../core/math'
 import { materialAt } from '../sim/materials'
+import { KIND_NODE } from '../sim/particles'
 import type { SimWorld } from '../sim/world'
 import type { Camera } from './camera'
 
@@ -106,6 +107,10 @@ export class SimView {
     const palive = p.slots.alive
     for (let i = 0; i < p.highWater; i++) {
       if (palive[i] !== 1) continue
+      // Structure nodes only. This used to draw a circle for EVERY particle,
+      // including thousands of fluid particles the fluid renderer had already
+      // drawn - 13.75ms a frame of pure redundancy at 6k particles.
+      if (p.kind[i] !== KIND_NODE) continue
       const pinned = p.invMass[i] === 0
       g.circle(p.posX[i]!, p.posY[i]!, pinned ? 0.26 : 0.13)
       g.fill(pinned ? 0xff9d5c : 0x2f3944)
