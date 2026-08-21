@@ -137,8 +137,20 @@ export class EditorController {
       }
 
       case 'delete': {
+        // Most specific first: a member is a thin target, an object a large
+        // one, so picking the object first would make members unclickable.
         const member = this.session.pickMember(world.x, world.y, snap)
-        if (member) this.session.removeMember(member)
+        if (member) {
+          this.session.removeMember(member)
+          break
+        }
+        const anchor = this.session.pickAnchor(world.x, world.y, snap * 1.5)
+        if (anchor) {
+          this.session.removeAnchor(anchor)
+          break
+        }
+        const object = this.session.pickObject(world.x, world.y)
+        if (object) this.session.removeObject(object)
         break
       }
     }

@@ -64,7 +64,9 @@ export const MATERIALS: Record<MaterialId, Material> = {
     zetaBend: 0.9,
     damageOnset: 0.6,
     damageRate: 0.35,
-    colour: 0xd8b478,
+    // Dark brown. The old tan was within a few percent of the sand palette,
+    // so wooden members vanished into the beach behind them.
+    colour: 0x7a4a26,
     dragCoefficient: 1.3,
     segmentsPerMetre: 0.5,
   },

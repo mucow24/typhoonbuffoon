@@ -3,6 +3,7 @@ import type { Cluster } from '../sim/clusters'
 import type { SimWorld } from '../sim/world'
 import { buildBeam } from '../scenes/demos'
 import {
+  cloneLevel,
   cloneSolution,
   emptySolution,
   nextId,
@@ -13,6 +14,17 @@ import {
   type WorldObjectDoc,
 } from '../model/level'
 import type { Field } from '../world/field'
+
+/**
+ * Undo captures the LEVEL as well as the solution. Anchors and world objects
+ * live in the document, so snapshotting only the solution meant placing an
+ * anchor was invisible to undo - Ctrl+Z would silently revert some earlier,
+ * unrelated member edit instead, which is worse than doing nothing.
+ */
+interface EditSnapshot {
+  solution: Solution
+  doc: LevelDoc
+}
 
 interface MemberSim {
   nodes: number[]
@@ -37,8 +49,8 @@ export class Session {
   private readonly nodeSim = new Map<string, number>()
   private readonly memberSim = new Map<string, MemberSim>()
   private readonly objectSim = new Map<string, Cluster>()
-  private undoStack: Solution[] = []
-  private redoStack: Solution[] = []
+  private undoStack: EditSnapshot[] = []
+  private redoStack: EditSnapshot[] = []
 
   running = false
 
@@ -308,9 +320,19 @@ export class Session {
    * inverse operations for every edit.
    */
   private pushUndo(): void {
-    this.undoStack.push(cloneSolution(this.solution))
+    this.undoStack.push({ solution: cloneSolution(this.solution), doc: cloneLevel(this.doc) })
     if (this.undoStack.length > 100) this.undoStack.shift()
     this.redoStack.length = 0
+  }
+
+  private snapshotNow(): EditSnapshot {
+    return { solution: cloneSolution(this.solution), doc: cloneLevel(this.doc) }
+  }
+
+  private restore(snap: EditSnapshot): void {
+    this.solution = snap.solution
+    this.doc = snap.doc
+    this.rebuild()
   }
 
   canUndo(): boolean {
@@ -324,22 +346,21 @@ export class Session {
   undo(): void {
     const prev = this.undoStack.pop()
     if (!prev) return
-    this.redoStack.push(cloneSolution(this.solution))
-    this.solution = prev
-    this.rebuild()
+    this.redoStack.push(this.snapshotNow())
+    this.restore(prev)
   }
 
   redo(): void {
     const next = this.redoStack.pop()
     if (!next) return
-    this.undoStack.push(cloneSolution(this.solution))
-    this.solution = next
-    this.rebuild()
+    this.undoStack.push(this.snapshotNow())
+    this.restore(next)
   }
 
   // --------------------------------------------------------------- authoring
 
   addAnchor(x: number, y: number, attachedTo: string | null = null): string {
+    this.pushUndo()
     const id = nextId('a')
     this.doc.anchors.push({ id, x, y, attachedTo })
     this.spawnAnchor({ id, x, y, attachedTo })
@@ -347,11 +368,67 @@ export class Session {
   }
 
   addWorldObject(obj: Omit<WorldObjectDoc, 'id'>): string {
+    this.pushUndo()
     const id = nextId('o')
     const doc = { id, ...obj }
     this.doc.objects.push(doc)
     this.spawnObject(doc)
     return id
+  }
+
+  /** Nearest anchor to a world point, within `radius`. */
+  pickAnchor(x: number, y: number, radius: number): string | null {
+    let best: string | null = null
+    let bestD = radius * radius
+    for (const a of this.doc.anchors) {
+      const pos = this.nodePosition(a.id) ?? a
+      const d = (pos.x - x) ** 2 + (pos.y - y) ** 2
+      if (d < bestD) {
+        bestD = d
+        best = a.id
+      }
+    }
+    return best
+  }
+
+  /**
+   * Remove an anchor, and any members that hung off it. Leaving dangling
+   * members would put the solution in a state rebuild() silently drops, which
+   * is how you get a member you are billed for but cannot see.
+   */
+  removeAnchor(id: string): void {
+    const idx = this.doc.anchors.findIndex((a) => a.id === id)
+    if (idx < 0) return
+    this.pushUndo()
+    this.doc.anchors.splice(idx, 1)
+    this.dropMembersReferencing(new Set([id]))
+    this.rebuild()
+  }
+
+  /** Remove an object, the anchors bound to it, and anything built on those. */
+  removeObject(id: string): void {
+    const idx = this.doc.objects.findIndex((o) => o.id === id)
+    if (idx < 0) return
+    this.pushUndo()
+    const orphanedAnchors = new Set(
+      this.doc.anchors.filter((a) => a.attachedTo === id).map((a) => a.id),
+    )
+    this.doc.objects.splice(idx, 1)
+    this.doc.anchors = this.doc.anchors.filter((a) => a.attachedTo !== id)
+    this.dropMembersReferencing(orphanedAnchors)
+    this.rebuild()
+  }
+
+  private dropMembersReferencing(ids: Set<string>): void {
+    this.solution.members = this.solution.members.filter(
+      (m) => !ids.has(m.a) && !ids.has(m.b),
+    )
+    const used = new Set<string>()
+    for (const m of this.solution.members) {
+      used.add(m.a)
+      used.add(m.b)
+    }
+    this.solution.nodes = this.solution.nodes.filter((n) => used.has(n.id))
   }
 
   /** Which object, if any, contains this point. */
