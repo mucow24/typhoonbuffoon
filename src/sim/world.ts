@@ -109,9 +109,15 @@ export class SimWorld {
       // Bending first, axial last: in Gauss-Seidel the last solve dominates
       // locally, and members must hold their length before they hold their
       // shape. Stiff axially, compliant in bending.
+      // Clusters FIRST, then the structural constraints. In Gauss-Seidel the
+      // last solve wins locally: with shape matching last it snapped object
+      // particles back to the rigid formation every substep, undoing the welds
+      // that attach a structure to the object. The two then fought and pumped
+      // energy in - a supported house rose and flipped. Structure last means
+      // load actually transfers into the object.
+      for (const c of this.clusters) if (c.alive) c.solve(this.particles)
       this.bend.solve(this.particles, h)
       this.distance.solve(this.particles, h)
-      for (const c of this.clusters) if (c.alive) c.solve(this.particles)
       if (s % this.fluid.substepsPerProjection === 0) this.fluid.project(this.particles)
       this.solveFluidAgainstMembers()
       this.solveFluidAgainstObjects()

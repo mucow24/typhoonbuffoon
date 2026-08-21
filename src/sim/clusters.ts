@@ -28,6 +28,8 @@ export class Cluster {
   readonly totalMass: number
   /** 0..1. 1 holds shape hard; lower is squashier. */
   stiffness = 1
+  /** Per-substep correction cap, as a multiple of particle radius. */
+  maxCorrection = 0.35
   alive = true
 
   cx = 0
@@ -118,8 +120,25 @@ export class Cluster {
       const qy = this.restY[k]!
       const gx = comX + cos * qx - sin * qy
       const gy = comY + sin * qx + cos * qy
-      p.posX[i]! += (gx - p.posX[i]!) * k0
-      p.posY[i]! += (gy - p.posY[i]!) * k0
+
+      let dx = (gx - p.posX[i]!) * k0
+      let dy = (gy - p.posY[i]!) * k0
+
+      // Bound the correction. Shape matching and terrain contact fight each
+      // other - contact pushes a particle out of the ground, this pulls it
+      // back in - and because (pos - prev)/h turns position corrections into
+      // velocity, an unbounded fight pumps energy in. An unsupported house rose
+      // 6 m and flipped over. Same failure mode as the fluid corrections.
+      const maxCorr = this.maxCorrection * p.radius[i]!
+      const mag = Math.sqrt(dx * dx + dy * dy)
+      if (mag > maxCorr && mag > 1e-12) {
+        const s = maxCorr / mag
+        dx *= s
+        dy *= s
+      }
+
+      p.posX[i]! += dx
+      p.posY[i]! += dy
     }
   }
 

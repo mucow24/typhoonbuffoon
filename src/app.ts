@@ -1,29 +1,31 @@
 import { GameLoop } from './core/loop'
 import { Rng } from './core/rng'
-import { CameraController } from './input/cameraController'
-import { createRenderer, type Renderer } from './render/app'
-import { Camera } from './render/camera'
-import { Scenery } from './render/scenery'
-import { FluidView } from './render/fluidView'
-import { SimView } from './render/simView'
-import { buildBeam, buildChain, buildLoadTest } from './scenes/demos'
-import { materialAt, type MaterialId } from './sim/materials'
-import { SimWorld } from './sim/world'
-import { DebugOverlay } from './ui/debug'
-import { Choice, NumberField, Panel, Slider, button } from './ui/controls'
-import { Field } from './world/field'
+import { EditorController, type ToolName } from './editor/tools'
 import {
   Conditions,
   FLOOD_MAX_M,
   WIND_MAX_KPH,
   type WaveStrength,
 } from './game/conditions'
-
-type SceneName = 'loadtest' | 'cantilever' | 'palm' | 'chain' | 'float'
+import { Session } from './game/session'
+import { CameraController } from './input/cameraController'
+import { defaultLevel, migrateLevel, migrateSolution } from './model/level'
+import { createRenderer, type Renderer } from './render/app'
+import { Camera } from './render/camera'
+import { EditorView } from './render/editorView'
+import { FluidView } from './render/fluidView'
+import { Scenery } from './render/scenery'
+import { SimView } from './render/simView'
+import { buildBeam, buildLoadTest } from './scenes/demos'
+import { materialAt, type MaterialId } from './sim/materials'
+import { SimWorld } from './sim/world'
+import { Choice, NumberField, Panel, Slider, button, toggle } from './ui/controls'
+import { DebugOverlay } from './ui/debug'
+import { Field } from './world/field'
 
 /**
- * Composition root. Owns the renderer, the fixed-timestep loop and the sim, and
- * grows as the steps in docs/PLAN.md land.
+ * Composition root. Owns the renderer, the fixed-timestep loop, the sim, and
+ * the editor session.
  */
 export class Game {
   readonly renderer: Renderer
@@ -37,15 +39,14 @@ export class Game {
   readonly sim: SimWorld
   readonly simView: SimView
   readonly fluidView: FluidView
+  readonly editorView: EditorView
   readonly conditions: Conditions
+  readonly session: Session
+  readonly editor: EditorController
 
-  materialId: MaterialId = 'wood'
-  segments = 0 // 0 means derive from the material
-  tipMassKg = 0
-  sceneName: SceneName = 'loadtest'
-
-  /** Breakages since the last scene reset, for the HUD. */
   private breakCount = 0
+  private budgetLabel: HTMLDivElement | null = null
+  private toolChoice: Choice<ToolName> | null = null
 
   private constructor(renderer: Renderer) {
     this.renderer = renderer
@@ -59,28 +60,41 @@ export class Game {
     this.simView = new SimView(renderer.world, this.sim)
     this.fluidView = new FluidView(renderer.world, renderer.app.renderer, this.sim)
     this.syncBounds()
+
     this.conditions = new Conditions(this.sim, this.field)
+    this.session = new Session(defaultLevel(this.field.widthM), this.sim, this.field)
 
     this.cameraController = new CameraController(this.camera, renderer.app.canvas, renderer)
+    this.editor = new EditorController(
+      renderer.app.canvas,
+      this.camera,
+      renderer,
+      this.session,
+      this.field,
+    )
+    // Build tools claim the left button; panning falls back to middle-drag and
+    // space-drag, as the camera controller was written to expect.
+    this.cameraController.panWithLeft = false
+    this.editorView = new EditorView(renderer.world, this.session, this.editor)
 
     this.field.onChange(() => {
       this.sim.terrain = this.field.terrain
       this.syncBounds()
-      this.rebuildScene()
+      this.session.syncWidth()
+      this.session.rebuild()
     })
 
     this.camera.fitWidth(this.field.widthM, renderer.width)
     this.camera.y = 6
-
     renderer.app.renderer.on('resize', () => this.scenery.invalidate())
 
     this.hud = new DebugOverlay()
+    this.buildBuildPanel()
     this.buildFieldPanel()
-    this.buildSolverPanel()
-    this.buildScenePanel()
-    this.buildWaterPanel()
     this.buildConditionsPanel()
-    this.rebuildScene()
+    this.buildSolverPanel()
+
+    this.seedStarterLevel()
 
     this.loop = new GameLoop({
       fixedHz: 60,
@@ -92,27 +106,47 @@ export class Game {
       .add('frame', () => `${this.loop.stats.smoothedFrameMs.toFixed(1)} ms`)
       .add('fps', () => `${(1000 / Math.max(this.loop.stats.smoothedFrameMs, 0.001)).toFixed(0)}`)
       .add('substeps', () => String(this.sim.substeps))
-      .add('sim time', () => `${this.loop.stats.simTime.toFixed(1)} s`)
       .add('field', () => `${this.field.widthM.toFixed(0)} m`)
-      .add('zoom', () => `${this.camera.zoom.toFixed(2)}x`)
       .add('particles', () => String(this.sim.particles.count))
-      .add('members', () => String(this.sim.distance.count))
-      .add('bends', () => String(this.sim.bend.count))
+      .add('water', () => String(this.sim.fluidCount))
+      .add('members', () => String(this.session.solution.members.length))
+      .add('objects', () => String(this.sim.objectCount))
       .add('peak load', () => `${(this.peakLoad() * 100).toFixed(0)}%`)
       .add('max damage', () => `${(this.maxDamage() * 100).toFixed(0)}%`)
       .add('broken', () => String(this.breakCount))
-      .add('water', () => String(this.sim.fluidCount))
-      .add('objects', () => String(this.sim.objectCount))
-      .add('wind', () => `${this.conditions.windKph.toFixed(0)} kph`)
-      .add('gust', () => `${(this.sim.wind.gustFactor() * this.conditions.windKph).toFixed(0)} kph`)
-      .add('flood', () => `${this.conditions.floodLevelM.toFixed(1)} m`)
+      .add('wind', () => `${(this.sim.wind.gustFactor() * this.conditions.windKph).toFixed(0)} kph`)
   }
 
   static async create(): Promise<Game> {
     return new Game(await createRenderer())
   }
 
-  /** Highest fraction-of-break-threshold across all live members. */
+  /** A couple of anchors and a house, so there is something to build onto. */
+  private seedStarterLevel(): void {
+    const t = this.field.terrain
+    const x = -8
+    const ground = t.heightAt(x)
+    this.session.addAnchor(x - 3, t.heightAt(x - 3))
+    this.session.addAnchor(x + 3, t.heightAt(x + 3))
+
+    const houseY = ground + 9
+    const houseId = this.session.addWorldObject({
+      x,
+      y: houseY,
+      width: 8,
+      height: 4.5,
+      // Light enough that a wood truss is a real option, not just steel. A
+      // 12.6t house needed 400kN members; at this weight the choice is a
+      // trade rather than a foregone conclusion.
+      density: 150,
+      label: 'house',
+    })
+    // Anchors underneath the house: build stilts to them, or watch it fall.
+    this.session.addAnchor(x - 3, houseY - 2.25, houseId)
+    this.session.addAnchor(x + 3, houseY - 2.25, houseId)
+    this.session.rebuild()
+  }
+
   peakLoad(): number {
     const d = this.sim.distance
     let peak = 0
@@ -139,9 +173,103 @@ export class Game {
     this.sim.boundsX1 = this.field.right
   }
 
+  private fitView(): void {
+    this.camera.fitWidth(this.field.widthM, this.renderer.width)
+    this.camera.x = 0
+    this.camera.y = this.field.terrain.maxHeight * 0.4
+  }
+
+  // ------------------------------------------------------------------ panels
+
+  private buildBuildPanel(): void {
+    const panel = new Panel({ title: 'build', side: 'left', width: 215 })
+
+    this.toolChoice = new Choice<ToolName>(panel.body, {
+      label: 'tool',
+      value: this.editor.tool,
+      options: [
+        { value: 'build', label: 'member (1)' },
+        { value: 'anchor', label: 'anchor (2)' },
+        { value: 'object', label: 'object (3)' },
+        { value: 'delete', label: 'delete (4)' },
+        { value: 'pan', label: 'pan (5)' },
+      ],
+      onChange: (v) => {
+        this.editor.tool = v
+      },
+    })
+
+    new Choice<MaterialId>(panel.body, {
+      label: 'material',
+      value: this.editor.material,
+      options: [
+        { value: 'wood', label: 'wood (q)' },
+        { value: 'steel', label: 'steel (w)' },
+      ],
+      onChange: (v) => {
+        this.editor.material = v
+      },
+    })
+
+    new Slider(panel.body, {
+      label: 'grid snap',
+      min: 0,
+      max: 4,
+      step: 0.25,
+      value: this.editor.gridSnap,
+      format: (v) => (v === 0 ? 'off' : `${v.toFixed(2)} m`),
+      onInput: (v) => {
+        this.editor.gridSnap = v
+      },
+    })
+
+    this.budgetLabel = panel.note('')
+
+    button(panel.body, 'undo (ctrl+z)', () => this.session.undo())
+    button(panel.body, 'redo (ctrl+shift+z)', () => this.session.redo())
+    button(panel.body, 'clear build', () => this.session.clearBuild())
+
+    panel.section('session')
+    button(panel.body, 'play (snapshot)', () => this.session.play())
+    button(panel.body, 'reset to snapshot', () => {
+      this.session.reset()
+      this.breakCount = 0
+    })
+
+    panel.section('level')
+    button(panel.body, 'save level + build', () => this.saveToDisk())
+    button(panel.body, 'load level + build', () => this.loadFromDisk())
+    button(panel.body, 'clear everything', () => this.session.clearAll())
+  }
+
+  private buildFieldPanel(): void {
+    const panel = new Panel({ title: 'field', side: 'left', width: 215 })
+    panel.root.style.top = '430px'
+
+    new NumberField(panel.body, {
+      label: 'width',
+      value: this.field.widthM,
+      min: 5,
+      step: 5,
+      suffix: 'm',
+      onCommit: (v) => {
+        this.field.setWidth(v)
+        this.fitView()
+      },
+    })
+    button(panel.body, 'fit view', () => this.fitView())
+
+    panel.section('probe scenes')
+    button(panel.body, 'stilt house', () => this.loadProbe('stilts'))
+    button(panel.body, 'load test', () => this.loadProbe('loadtest'))
+    button(panel.body, 'palm', () => this.loadProbe('palm'))
+
+    panel.note('middle-drag or space-drag to pan')
+  }
+
   private buildConditionsPanel(): void {
-    const panel = new Panel({ title: 'conditions', side: 'right', width: 200 })
-    panel.root.style.top = '620px'
+    const panel = new Panel({ title: 'conditions', side: 'right', width: 205 })
+    panel.root.style.top = '330px'
 
     new Slider(panel.body, {
       label: 'wind',
@@ -182,28 +310,10 @@ export class Game {
       },
     })
 
-    button(panel.body, 'calm', () => {
-      this.conditions.reset()
-      this.rebuildPanels()
-    })
-  }
-
-  /** Panels hold their own state; simplest refresh is a reload of the page. */
-  private rebuildPanels(): void {
-    // Sliders are re-read from conditions on next construction; for now the
-    // values simply stop driving the sim, which is what 'calm' means.
-  }
-
-  private buildWaterPanel(): void {
-    const panel = new Panel({ title: 'water', side: 'right', width: 200 })
-    panel.root.style.top = '320px'
-
-    // Resolution is a control rather than a constant: field width is unclamped
-    // and flood depth is up to 20 m, so spacing is the lever that keeps the
-    // particle count affordable. Deliberately not clamped - see docs/PLAN.md 8.
+    panel.section('water')
     new Slider(panel.body, {
       label: 'resolution',
-      min: 0.1,
+      min: 0.15,
       max: 1.5,
       step: 0.05,
       value: this.sim.fluid.spacing,
@@ -213,82 +323,20 @@ export class Game {
       },
     })
 
-    new Slider(panel.body, {
-      label: 'viscosity',
-      min: 0,
-      max: 0.4,
-      step: 0.01,
-      value: this.sim.fluid.viscosity,
-      format: (v) => v.toFixed(2),
-      onInput: (v) => {
-        this.sim.fluid.viscosity = v
-      },
-    })
-
-    new Slider(panel.body, {
-      label: 'fluid iters',
-      min: 1,
-      max: 6,
-      step: 1,
-      value: this.sim.fluid.iterations,
-      format: (v) => v.toFixed(0),
-      onInput: (v) => {
-        this.sim.fluid.iterations = v
-      },
-    })
-
-    button(panel.body, 'dump water', () => {
+    button(panel.body, 'dump water here', () => {
       const t = this.field.terrain
-      const x = this.camera.x
-      this.sim.spawnBlock(x, t.heightAt(x) + 14, 10, 8)
+      this.sim.spawnBlock(this.camera.x, t.heightAt(this.camera.x) + 12, 10, 8)
     })
-
     button(panel.body, 'clear water', () => this.sim.clearFluid())
-
-    panel.section('objects')
-    button(panel.body, 'drop wood crate', () => {
-      const t = this.field.terrain
-      this.sim.addObject({
-        cx: this.camera.x, cy: t.heightAt(this.camera.x) + 12,
-        width: 2.4, height: 1.6, density: 500,
-      })
+    button(panel.body, 'calm', () => {
+      this.conditions.reset()
+      this.sim.clearFluid()
     })
-    button(panel.body, 'drop steel crate', () => {
-      const t = this.field.terrain
-      this.sim.addObject({
-        cx: this.camera.x + 3, cy: t.heightAt(this.camera.x) + 12,
-        width: 2.0, height: 1.4, density: 7850,
-      })
-    })
-    button(panel.body, 'clear objects', () => this.sim.clearObjects())
-  }
-
-  private fitView(): void {
-    this.camera.fitWidth(this.field.widthM, this.renderer.width)
-    this.camera.x = 0
-    this.camera.y = this.field.terrain.maxHeight * 0.4
-  }
-
-  private buildFieldPanel(): void {
-    const panel = new Panel({ title: 'field', side: 'left', width: 205 })
-    new NumberField(panel.body, {
-      label: 'width',
-      value: this.field.widthM,
-      min: 5,
-      step: 5,
-      suffix: 'm',
-      onCommit: (v) => {
-        this.field.setWidth(v)
-        this.fitView()
-      },
-    })
-    button(panel.body, 'fit view', () => this.fitView())
-    panel.note('drag to pan, wheel to zoom')
   }
 
   private buildSolverPanel(): void {
-    const panel = new Panel({ title: 'solver', side: 'left', width: 205 })
-    panel.root.style.top = '150px'
+    const panel = new Panel({ title: 'solver', side: 'right', width: 205, collapsed: true })
+    panel.root.style.top = '690px'
 
     new Slider(panel.body, {
       label: 'substeps',
@@ -313,132 +361,93 @@ export class Game {
         this.sim.linearDamping = v
       },
     })
-  }
-
-  private buildScenePanel(): void {
-    const panel = new Panel({ title: 'probe', side: 'left', width: 205 })
-    panel.root.style.top = '272px'
-
-    new Choice<MaterialId>(panel.body, {
-      label: 'material',
-      value: this.materialId,
-      options: [
-        { value: 'wood', label: 'wood' },
-        { value: 'steel', label: 'steel' },
-      ],
-      onChange: (v) => {
-        this.materialId = v
-        this.rebuildScene()
-      },
-    })
-
-    new Choice<SceneName>(panel.body, {
-      label: 'scene',
-      value: this.sceneName,
-      options: [
-        { value: 'loadtest', label: 'load test' },
-        { value: 'float', label: 'float test' },
-        { value: 'cantilever', label: 'cantilever' },
-        { value: 'palm', label: 'palm' },
-        { value: 'chain', label: 'chain' },
-      ],
-      onChange: (v) => {
-        this.sceneName = v
-        this.rebuildScene()
-      },
-    })
 
     new Slider(panel.body, {
-      label: 'segments',
-      min: 0,
-      max: 12,
+      label: 'fluid iters',
+      min: 1,
+      max: 6,
       step: 1,
-      value: this.segments,
-      format: (v) => (v === 0 ? 'auto' : v.toFixed(0)),
+      value: this.sim.fluid.iterations,
+      format: (v) => v.toFixed(0),
       onInput: (v) => {
-        this.segments = v
-        this.rebuildScene()
+        this.sim.fluid.iterations = v
       },
     })
 
-    new Slider(panel.body, {
-      label: 'tip load',
-      min: 0,
-      max: 60000,
-      step: 500,
-      value: this.tipMassKg,
-      format: (v) => `${(v / 1000).toFixed(1)} t`,
-      onInput: (v) => {
-        this.tipMassKg = v
-        this.rebuildScene()
-      },
+    toggle(panel.body, 'stress colours', this.simView.showStress, (v) => {
+      this.simView.showStress = v
     })
-
-    button(panel.body, 'reset scene', () => this.rebuildScene())
-    panel.note('material constants live in sim/materials.ts')
+    toggle(panel.body, 'show nodes', this.simView.showNodes, (v) => {
+      this.simView.showNodes = v
+    })
   }
 
-  /** Rebuild the sim from scratch. Cheap, and keeps reset honest. */
-  rebuildScene(): void {
-    this.sim.clear()
-    this.breakCount = 0
+  // ------------------------------------------------------------------ probes
 
+  private loadProbe(which: 'stilts' | 'loadtest' | 'palm'): void {
+    this.session.clearAll()
+    this.conditions.reset()
+    this.sim.clearFluid()
     const t = this.field.terrain
-    const x = t.x0 + this.field.widthM * 0.22
-    const segments = this.segments > 0 ? this.segments : undefined
+    const x = -8
 
-    switch (this.sceneName) {
-      case 'chain':
-        buildChain(this.sim, { x, y: t.maxHeight + 16, links: 14, spacing: 0.9 })
-        break
-
-      case 'cantilever': {
-        const y = t.heightAt(x) + 14
-        buildBeam(this.sim, {
-          x0: x,
-          y0: y,
-          x1: x + 12,
-          y1: y,
-          material: this.materialId,
-          segments,
-          clampStart: true,
-        })
-        break
-      }
-
-      case 'palm': {
-        const y = t.heightAt(x)
-        buildBeam(this.sim, {
-          x0: x,
-          y0: y,
-          x1: x,
-          y1: y + 13,
-          material: this.materialId,
-          segments,
-          clampStart: true,
-        })
-        break
-      }
-
-      case 'float': {
-        // Wood floats, steel sinks - same code path, different density.
-        this.sim.fillTo(0)
-        this.sim.addObject({ cx: 6, cy: 6, width: 3, height: 1.6, density: 500 })
-        this.sim.addObject({ cx: 12, cy: 6, width: 2.4, height: 1.4, density: 7850 })
-        break
-      }
-
-      case 'loadtest':
-        buildLoadTest(this.sim, {
-          x,
-          y: t.heightAt(x) + 14,
-          material: this.materialId,
-          segments,
-          tipMassKg: this.tipMassKg,
-        })
-        break
+    if (which === 'stilts') {
+      this.seedStarterLevel()
+      return
     }
+    if (which === 'loadtest') {
+      buildLoadTest(this.sim, { x, y: t.heightAt(x) + 14, material: 'wood', tipMassKg: 8000 })
+      return
+    }
+    buildBeam(this.sim, {
+      x0: x,
+      y0: t.heightAt(x),
+      x1: x,
+      y1: t.heightAt(x) + 13,
+      material: 'wood',
+      clampStart: true,
+    })
   }
+
+  // ------------------------------------------------------------ save / load
+
+  private saveToDisk(): void {
+    const payload = JSON.stringify(
+      { level: this.session.doc, solution: this.session.solution },
+      null,
+      2,
+    )
+    const blob = new Blob([payload], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${this.session.doc.name || 'level'}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  private loadFromDisk(): void {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'application/json'
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0]
+      if (!file) return
+      try {
+        const parsed = JSON.parse(await file.text()) as { level?: unknown; solution?: unknown }
+        this.session.doc = migrateLevel(parsed.level)
+        this.session.solution = migrateSolution(parsed.solution)
+        this.field.setWidth(this.session.doc.widthM)
+        this.session.rebuild()
+        this.fitView()
+      } catch (err) {
+        console.error('failed to load level', err)
+      }
+    })
+    input.click()
+  }
+
+  // -------------------------------------------------------------- loop hooks
 
   private fixedUpdate(dt: number): void {
     this.conditions.update(dt)
@@ -454,8 +463,22 @@ export class Game {
     this.scenery.update(this.camera, this.renderer.width, this.renderer.height)
     this.simView.update(this.camera, this.renderer.width, this.renderer.height)
     this.fluidView.update(this.camera, this.renderer.width, this.renderer.height)
+    this.editorView.update(this.camera, this.renderer.width, this.renderer.height)
     this.renderer.app.render()
     this.hud.update()
+    this.updateBudgetLabel()
+    if (this.toolChoice) this.toolChoice.set(this.editor.tool)
+  }
+
+  private updateBudgetLabel(): void {
+    if (!this.budgetLabel) return
+    const cost = this.session.cost()
+    const remaining = this.session.doc.budget - cost
+    const text = `spent $${cost.toFixed(0)} / $${this.session.doc.budget.toFixed(0)}`
+    if (this.budgetLabel.textContent !== text) {
+      this.budgetLabel.textContent = text
+      this.budgetLabel.style.color = remaining < 0 ? '#e2483c' : 'var(--text-dim)'
+    }
   }
 
   start(): void {
@@ -466,11 +489,7 @@ export class Game {
     this.loop.stop()
   }
 
-  /**
-   * Advance the sim synchronously, without waiting on requestAnimationFrame.
-   * This is how the sim gets verified numerically (does the chain sag, does the
-   * wood float, does the beam break) rather than by squinting at pixels.
-   */
+  /** Advance the sim synchronously, for headless verification. */
   pump(steps = 1): void {
     for (let i = 0; i < steps; i++) this.loop.step()
   }
