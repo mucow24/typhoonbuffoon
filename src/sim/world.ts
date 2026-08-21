@@ -88,10 +88,15 @@ export class SimWorld {
   waterDrag = 2.2
   /** Fraction of a contact penetration resolved per substep. */
   contactRelaxation = 0.35
+  /** How much of the inbound normal velocity a contact removes, 0..1. */
+  contactNormalDamping = 0.6
   /** Hard cap on one substep's contact push, metres. */
   maxContactCorrection = 0.05
   /** Hard cap on one substep's terrain push, metres. */
   maxTerrainPush = 0.35
+  private contactDX = new Float32Array(4096)
+  private contactDY = new Float32Array(4096)
+  private contactHits = new Int32Array(4096)
   private contactStamp = new Int32Array(4096)
   private stampCounter = 0
   private readonly tmpVel = { x: 0, y: 0 }
@@ -130,8 +135,10 @@ export class SimWorld {
       // large before the tiny substep h multiplies it again. Small steps only
       // work when every step is corrected.
       this.fluid.project(this.particles, h)
+      this.beginContacts()
       this.solveFluidAgainstMembers()
       this.solveFluidAgainstObjects()
+      this.resolveContacts()
       this.solveContacts()
       this.updateVelocities(h)
       this.bend.dampVelocities(this.particles, h)
@@ -378,28 +385,12 @@ export class SimWorld {
             // Resolved over several substeps rather than in one jump: a full
             // penetration of one particle spacing discharged in a single 1.4 ms
             // substep is a 280 m/s impulse.
+            // Gathered, not applied here. See resolveContacts.
             const pen = Math.min(minDist - dist, this.maxContactCorrection)
             const push = pen * this.contactRelaxation
-            p.posX[j]! += nx * push
-            p.posY[j]! += ny * push
-
-            // Inelastic contact, done properly: resolve the position, then
-            // remove the INBOUND NORMAL component of motion while leaving the
-            // tangential part alone.
-            //
-            // Neither shortcut works. Leaving prev untouched differentiates the
-            // push into velocity - 0.05 m over a 1.4 ms substep is 36 m/s, a
-            // wall of spray every time anything enters the water. Carrying prev
-            // along with the push kills the spike but preserves the velocity
-            // driving the particle into the solid, so it burrows straight
-            // through and a flood wall leaks a third of its water.
-            const dx2 = p.posX[j]! - p.prevX[j]!
-            const dy2 = p.posY[j]! - p.prevY[j]!
-            const vn = dx2 * nx + dy2 * ny
-            if (vn < 0) {
-              p.prevX[j] = p.posX[j]! - (dx2 - vn * nx)
-              p.prevY[j] = p.posY[j]! - (dy2 - vn * ny)
-            }
+            this.contactDX[j]! += nx * push
+            this.contactDY[j]! += ny * push
+            this.contactHits[j]!++
           }
         }
       }
@@ -456,28 +447,12 @@ export class SimWorld {
             }
 
             // One-way, and relaxed, for the same reasons as the member pass.
+            // Gathered, not applied here. See resolveContacts.
             const pen = Math.min(minDist - dist, this.maxContactCorrection)
             const push = pen * this.contactRelaxation
-            p.posX[j]! += nx * push
-            p.posY[j]! += ny * push
-
-            // Inelastic contact, done properly: resolve the position, then
-            // remove the INBOUND NORMAL component of motion while leaving the
-            // tangential part alone.
-            //
-            // Neither shortcut works. Leaving prev untouched differentiates the
-            // push into velocity - 0.05 m over a 1.4 ms substep is 36 m/s, a
-            // wall of spray every time anything enters the water. Carrying prev
-            // along with the push kills the spike but preserves the velocity
-            // driving the particle into the solid, so it burrows straight
-            // through and a flood wall leaks a third of its water.
-            const dx2 = p.posX[j]! - p.prevX[j]!
-            const dy2 = p.posY[j]! - p.prevY[j]!
-            const vn = dx2 * nx + dy2 * ny
-            if (vn < 0) {
-              p.prevX[j] = p.posX[j]! - (dx2 - vn * nx)
-              p.prevY[j] = p.posY[j]! - (dy2 - vn * ny)
-            }
+            this.contactDX[j]! += nx * push
+            this.contactDY[j]! += ny * push
+            this.contactHits[j]!++
           }
         }
       }
@@ -601,6 +576,84 @@ export class SimWorld {
       }
     }
     return false
+  }
+
+  private beginContacts(): void {
+    const n = this.particles.highWater
+    if (this.contactDX.length < n) {
+      const cap = Math.max(n, 4096)
+      this.contactDX = new Float32Array(cap)
+      this.contactDY = new Float32Array(cap)
+      this.contactHits = new Int32Array(cap)
+    }
+    this.contactDX.fill(0, 0, n)
+    this.contactDY.fill(0, 0, n)
+    this.contactHits.fill(0, 0, n)
+  }
+
+  /**
+   * Apply the substep's contacts once per particle, not once per contact.
+   *
+   * Applying each contact as it is found lets them STACK: a fluid particle
+   * caught between several particles of the same object collects a push from
+   * every one of them inside a single substep, and five pushes of 0.0175 m over
+   * 1.4 ms is 63 m/s. That is the spray that erupts the instant anything
+   * touches the water.
+   *
+   * Averaging the corrections instead of summing them also makes the result
+   * independent of the order contacts happen to be visited in, which is what
+   * makes it reproducible.
+   */
+  private resolveContacts(): void {
+    const p = this.particles
+    const n = p.highWater
+    for (let j = 0; j < n; j++) {
+      const hits = this.contactHits[j]!
+      if (hits === 0) continue
+      if (p.slots.alive[j] !== 1 || p.invMass[j] === 0) continue
+
+      let dx = this.contactDX[j]! / hits
+      let dy = this.contactDY[j]! / hits
+      const mag = Math.sqrt(dx * dx + dy * dy)
+      if (mag < 1e-12) continue
+      if (mag > this.maxContactCorrection) {
+        const k = this.maxContactCorrection / mag
+        dx *= k
+        dy *= k
+      }
+
+      // BOTH halves, together. Each alone is wrong, and I tried each alone:
+      //
+      //  - move pos only: the push is differentiated into velocity and erupts
+      //    as spray the instant anything enters the water;
+      //  - move pos and prev only: no spray, but the velocity driving the
+      //    particle into the solid survives, so it burrows through and a flood
+      //    wall leaks a third of its water.
+      //
+      // Moving prev with the push makes the correction itself contribute no
+      // velocity. (pos - prev) is then exactly the motion the particle already
+      // had, and the inbound normal part of THAT is what a contact should kill.
+      p.posX[j]! += dx
+      p.posY[j]! += dy
+      p.prevX[j]! += dx
+      p.prevY[j]! += dy
+
+      const inv = 1 / Math.hypot(dx, dy)
+      const nx = dx * inv
+      const ny = dy * inv
+      const rx = p.posX[j]! - p.prevX[j]!
+      const ry = p.posY[j]! - p.prevY[j]!
+      const vn = rx * nx + ry * ny
+      if (vn < 0) {
+        // Damp the inbound normal velocity rather than annihilating it.
+        // Removing it outright freezes the water against a hull: the level
+        // beneath a floating object stops replenishing, the height field reads
+        // a lower surface there, buoyancy falls with it and the object sinks.
+        const keep = 1 - this.contactNormalDamping
+        p.prevX[j] = p.posX[j]! - (rx - vn * nx * (1 - keep))
+        p.prevY[j] = p.posY[j]! - (ry - vn * ny * (1 - keep))
+      }
+    }
   }
 
   /** Add a rectangular physics object. Returns its cluster. */
