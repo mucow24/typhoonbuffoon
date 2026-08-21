@@ -2,6 +2,7 @@ import {
   MATERIALS,
   axialCompliance,
   bendCompliance,
+  areaOf,
   massPerMetre,
   materialIndex,
   segmentsFor,
@@ -112,6 +113,9 @@ export function buildBeam(sim: SimWorld, opts: BeamOptions): Beam {
         y: opts.y0 + uy * spacing * i,
         invMass: pinned ? 0 : 1 / nodeMass,
         radius,
+        // Rest volume: the member's cross-section times the length this node
+        // is responsible for. Never recomputed from deformed geometry.
+        volume: areaOf(mat) * spacing,
       }),
     )
   }

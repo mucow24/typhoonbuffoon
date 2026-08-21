@@ -1,7 +1,9 @@
 import type { Terrain } from '../world/terrain'
 import { BendConstraints } from './constraints/bending'
 import { DistanceConstraints } from './constraints/distance'
+import { Cluster, buildObject, type ObjectSpec } from './clusters'
 import { FluidSolver } from './fluid'
+import { WaterField } from './water'
 import { materialAt } from './materials'
 import { KIND_FLUID, ParticleStore } from './particles'
 import { Rng } from '../core/rng'
@@ -35,6 +37,8 @@ export class SimWorld {
   readonly distance = new DistanceConstraints(2048)
   readonly bend = new BendConstraints(2048)
   readonly fluid = new FluidSolver()
+  readonly water = new WaterField()
+  readonly clusters: Cluster[] = []
 
   gravity = -9.81
   substeps = 12
@@ -76,9 +80,23 @@ export class SimWorld {
    * reads as 3600 m/s. Stability rule 4 in docs/PLAN.md.
    */
   maxSpeed = 45
+  /** Water density for buoyancy, kg/m^3. */
+  waterDensity = 1000
+  /** Linear drag from submersion, per second. Stops floaters bobbing forever. */
+  waterDrag = 2.2
+  private contactStamp = new Int32Array(4096)
+  private stampCounter = 0
+  private readonly tmpVel = { x: 0, y: 0 }
 
   step(dt: number): void {
     const h = dt / this.substeps
+    this.water.build(
+      this.particles,
+      this.boundsX0,
+      this.boundsX1,
+      this.fluid.spacing * this.fluid.spacing,
+    )
+    this.applyBuoyancy()
     this.fluid.beginFrame(this.particles)
     for (let s = 0; s < this.substeps; s++) {
       this.predict(h)
@@ -89,7 +107,10 @@ export class SimWorld {
       // shape. Stiff axially, compliant in bending.
       this.bend.solve(this.particles, h)
       this.distance.solve(this.particles, h)
+      for (const c of this.clusters) if (c.alive) c.solve(this.particles)
       if (s % this.fluid.substepsPerProjection === 0) this.fluid.project(this.particles)
+      this.solveFluidAgainstMembers()
+      this.solveFluidAgainstObjects()
       this.solveContacts()
       this.updateVelocities(h)
       this.bend.dampVelocities(this.particles, h)
@@ -191,6 +212,211 @@ export class SimWorld {
 
   private grounded = new Uint8Array(4096)
 
+  /**
+   * Buoyancy and water drag, from REST volume. Computed once per frame into the
+   * acceleration accumulators.
+   *
+   * Net acceleration is g * (rhoWater/rhoBody - 1), so wood at 500 kg/m^3 rises
+   * and steel at 7850 sinks with no flag anywhere - density alone decides it.
+   */
+  private applyBuoyancy(): void {
+    const p = this.particles
+    const alive = p.slots.alive
+    const g = -this.gravity
+    for (let i = 0; i < p.highWater; i++) {
+      if (alive[i] !== 1 || p.invMass[i] === 0) continue
+      if (p.kind[i] === KIND_FLUID) continue
+      const vol = p.volume[i]!
+      if (vol <= 0) continue
+
+      const frac = this.water.submergedFraction(p.posX[i]!, p.posY[i]!, p.radius[i]!)
+      if (frac <= 0) continue
+
+      const mass = 1 / p.invMass[i]!
+      p.accY[i]! += g * ((this.waterDensity * vol) / mass) * frac
+
+      // Drag against the LOCAL WATER velocity, not absolute velocity, so a
+      // current or a passing wave actually pushes a body along instead of only
+      // slowing it down.
+      this.water.velocityAt(p.posX[i]!, this.tmpVel)
+      const drag = this.waterDrag * frac
+      p.accX[i]! -= (p.velX[i]! - this.tmpVel.x) * drag
+      p.accY[i]! -= (p.velY[i]! - this.tmpVel.y) * drag
+    }
+  }
+
+  /**
+   * Fluid against structural members. Members are line segments, so they are
+   * treated as capsules and fluid particles are pushed out with a mass-weighted
+   * reaction onto the member's endpoints - which is what lets a flood wall
+   * actually hold water back instead of being decorative.
+   *
+   * The capsule radius has a floor of 0.75 * particle spacing. A member thinner
+   * than about one particle spacing is not watertight and fluid tunnels through
+   * it, which on a flood wall reads as a bug rather than a near miss.
+   */
+  private solveFluidAgainstMembers(): void {
+    const d = this.distance
+    if (d.count === 0) return
+    const p = this.particles
+    const hash = this.fluid.hash
+    const spacing = this.fluid.spacing
+    const alive = d.slots.alive
+
+    if (this.contactStamp.length < p.highWater) {
+      this.contactStamp = new Int32Array(Math.max(p.highWater, 4096))
+    }
+
+    for (let m = 0; m < d.highWater; m++) {
+      if (alive[m] !== 1) continue
+      const ia = d.a[m]!
+      const ib = d.b[m]!
+      const ax = p.posX[ia]!
+      const ay = p.posY[ia]!
+      const bx = p.posX[ib]!
+      const by = p.posY[ib]!
+      const mat = materialAt(d.material[m]!)
+      const radius = Math.max(mat.section * 0.5, spacing * 0.75)
+
+      const ex = bx - ax
+      const ey = by - ay
+      const len2 = ex * ex + ey * ey
+      if (len2 < 1e-12) continue
+      const segLen = Math.sqrt(len2)
+
+      const stamp = ++this.stampCounter
+      const steps = Math.max(1, Math.ceil(segLen / Math.max(spacing, 0.05)))
+      for (let sIdx = 0; sIdx <= steps; sIdx++) {
+        const t = sIdx / steps
+        const sx = ax + ex * t
+        const sy = ay + ey * t
+        const buckets = hash.collectBuckets(sx, sy)
+        const starts = hash.starts
+        const entries = hash.entries
+        const scratch = hash.scratch
+
+        for (let s = 0; s < buckets; s++) {
+          const b = scratch[s]!
+          const end = starts[b + 1]!
+          for (let k = starts[b]!; k < end; k++) {
+            const j = entries[k]!
+            if (this.contactStamp[j] === stamp) continue
+            this.contactStamp[j] = stamp
+            if (p.slots.alive[j] !== 1 || p.invMass[j] === 0) continue
+
+            const px = p.posX[j]! - ax
+            const py = p.posY[j]! - ay
+            let u = (px * ex + py * ey) / len2
+            u = u < 0 ? 0 : u > 1 ? 1 : u
+            const cx = ax + ex * u
+            const cy = ay + ey * u
+            let nx = p.posX[j]! - cx
+            let ny = p.posY[j]! - cy
+            const dist = Math.sqrt(nx * nx + ny * ny)
+            const minDist = radius + p.radius[j]!
+            if (dist >= minDist) continue
+
+            if (dist < 1e-6) {
+              nx = -ey / segLen
+              ny = ex / segLen
+            } else {
+              nx /= dist
+              ny /= dist
+            }
+
+            // One-way: the fluid particle is pushed out, the member is not
+            // pushed back. All fluid -> body force is mediated by the water
+            // field (buoyancy + drag). Doing both double-counts buoyancy, and
+            // since a wood crate's particles are lighter than fluid particles
+            // the collision term dominated and launched objects tens of metres.
+            const pen = minDist - dist
+            p.posX[j]! += nx * pen
+            p.posY[j]! += ny * pen
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Fluid against object cluster particles.
+   *
+   * Without this, water flows straight through a crate: the object displaces
+   * nothing, so the height field reads water where the hull is, buoyancy is
+   * computed against a surface the object itself should have raised, and the
+   * result is a crate that launches. Objects have no distance constraints, so
+   * they are not covered by the member pass and need their own.
+   */
+  private solveFluidAgainstObjects(): void {
+    const p = this.particles
+    if (this.clusters.length === 0) return
+    const hash = this.fluid.hash
+    const starts = hash.starts
+    const entries = hash.entries
+    const scratch = hash.scratch
+
+    for (const c of this.clusters) {
+      if (!c.alive) continue
+      for (let k = 0; k < c.particles.length; k++) {
+        const i = c.particles[k]!
+        if (p.slots.alive[i] !== 1) continue
+        const xi = p.posX[i]!
+        const yi = p.posY[i]!
+        const ri = p.radius[i]!
+
+        const buckets = hash.collectBuckets(xi, yi)
+        for (let s = 0; s < buckets; s++) {
+          const b = scratch[s]!
+          const end = starts[b + 1]!
+          for (let q = starts[b]!; q < end; q++) {
+            const j = entries[q]!
+            if (p.slots.alive[j] !== 1) continue
+            if (p.invMass[j]! <= 0) continue
+
+            let nx = p.posX[j]! - xi
+            let ny = p.posY[j]! - yi
+            const dist = Math.sqrt(nx * nx + ny * ny)
+            const minDist = ri + p.radius[j]!
+            if (dist >= minDist) continue
+
+            if (dist < 1e-6) {
+              nx = 0
+              ny = 1
+            } else {
+              nx /= dist
+              ny /= dist
+            }
+
+            // One-way, for the same reason as the member pass above.
+            const pen = minDist - dist
+            p.posX[j]! += nx * pen
+            p.posY[j]! += ny * pen
+          }
+        }
+      }
+    }
+  }
+
+  /** Add a rectangular physics object. Returns its cluster. */
+  addObject(spec: ObjectSpec): Cluster {
+    const c = buildObject(this.particles, spec)
+    this.clusters.push(c)
+    return c
+  }
+
+  clearObjects(): void {
+    const p = this.particles
+    for (const c of this.clusters) {
+      for (const i of c.particles) if (p.slots.alive[i] === 1) p.destroy(i)
+      c.alive = false
+    }
+    this.clusters.length = 0
+  }
+
+  get objectCount(): number {
+    return this.clusters.filter((c) => c.alive).length
+  }
+
   private clearAccelerations(): void {
     const p = this.particles
     p.accX.fill(0, 0, p.highWater)
@@ -276,6 +502,7 @@ export class SimWorld {
     this.particles.clear()
     this.distance.clear()
     this.bend.clear()
+    this.clusters.length = 0
     this.breakEvents.length = 0
   }
 

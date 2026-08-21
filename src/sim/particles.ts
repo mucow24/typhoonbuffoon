@@ -13,6 +13,8 @@ export interface ParticleSpec {
   kind?: number
   /** Cluster id for shape-matched objects, -1 otherwise. */
   cluster?: number
+  /** Rest volume in m^3, for buoyancy. */
+  volume?: number
 }
 
 /**
@@ -37,6 +39,13 @@ export class ParticleStore {
   radius: Float32Array
   kind: Uint8Array
   cluster: Int32Array
+  /**
+   * REST volume, m^3 (per metre of depth). Buoyancy and wind drag are computed
+   * from this and never from deformed geometry: stretch -> more submerged
+   * volume -> more lift -> more stretch is a genuine runaway, and mass is
+   * conserved anyway - a stretched beam did not gain material.
+   */
+  volume: Float32Array
 
   constructor(capacity = 4096) {
     this.slots = new SlotAllocator(capacity)
@@ -52,6 +61,7 @@ export class ParticleStore {
     this.radius = new Float32Array(capacity)
     this.kind = new Uint8Array(capacity)
     this.cluster = new Int32Array(capacity)
+    this.volume = new Float32Array(capacity)
 
     this.slots.onGrow = (cap) => this.grow(cap)
   }
@@ -69,6 +79,7 @@ export class ParticleStore {
     this.radius = SlotAllocator.growF32(this.radius, cap)
     this.kind = SlotAllocator.growU8(this.kind, cap)
     this.cluster = SlotAllocator.growI32(this.cluster, cap)
+    this.volume = SlotAllocator.growF32(this.volume, cap)
   }
 
   get count(): number {
@@ -97,6 +108,7 @@ export class ParticleStore {
     this.radius[i] = spec.radius ?? 0.12
     this.kind[i] = spec.kind ?? KIND_NODE
     this.cluster[i] = spec.cluster ?? -1
+    this.volume[i] = spec.volume ?? 0
     return i
   }
 

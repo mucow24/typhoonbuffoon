@@ -13,7 +13,7 @@ import { DebugOverlay } from './ui/debug'
 import { Choice, NumberField, Panel, Slider, button } from './ui/controls'
 import { Field } from './world/field'
 
-type SceneName = 'loadtest' | 'cantilever' | 'palm' | 'chain'
+type SceneName = 'loadtest' | 'cantilever' | 'palm' | 'chain' | 'float'
 
 /**
  * Composition root. Owns the renderer, the fixed-timestep loop and the sim, and
@@ -93,6 +93,7 @@ export class Game {
       .add('max damage', () => `${(this.maxDamage() * 100).toFixed(0)}%`)
       .add('broken', () => String(this.breakCount))
       .add('water', () => String(this.sim.fluidCount))
+      .add('objects', () => String(this.sim.objectCount))
   }
 
   static async create(): Promise<Game> {
@@ -176,6 +177,23 @@ export class Game {
     })
 
     button(panel.body, 'clear water', () => this.sim.clearFluid())
+
+    panel.section('objects')
+    button(panel.body, 'drop wood crate', () => {
+      const t = this.field.terrain
+      this.sim.addObject({
+        cx: this.camera.x, cy: t.heightAt(this.camera.x) + 12,
+        width: 2.4, height: 1.6, density: 500,
+      })
+    })
+    button(panel.body, 'drop steel crate', () => {
+      const t = this.field.terrain
+      this.sim.addObject({
+        cx: this.camera.x + 3, cy: t.heightAt(this.camera.x) + 12,
+        width: 2.0, height: 1.4, density: 7850,
+      })
+    })
+    button(panel.body, 'clear objects', () => this.sim.clearObjects())
   }
 
   private fitView(): void {
@@ -252,6 +270,7 @@ export class Game {
       value: this.sceneName,
       options: [
         { value: 'loadtest', label: 'load test' },
+        { value: 'float', label: 'float test' },
         { value: 'cantilever', label: 'cantilever' },
         { value: 'palm', label: 'palm' },
         { value: 'chain', label: 'chain' },
@@ -331,6 +350,14 @@ export class Game {
           segments,
           clampStart: true,
         })
+        break
+      }
+
+      case 'float': {
+        // Wood floats, steel sinks - same code path, different density.
+        this.sim.fillTo(0)
+        this.sim.addObject({ cx: 6, cy: 6, width: 3, height: 1.6, density: 500 })
+        this.sim.addObject({ cx: 12, cy: 6, width: 2.4, height: 1.4, density: 7850 })
         break
       }
 

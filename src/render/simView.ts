@@ -79,6 +79,29 @@ export class SimView {
       g.stroke({ width: mat.section, color: colour, cap: 'round' })
     }
 
+    // Physics objects: shape-matched clusters, drawn from their best-fit frame
+    // rather than from the particles, so they read as solid things.
+    for (const c of this.sim.clusters) {
+      if (!c.alive) continue
+      const { hw, hh } = c.restExtent()
+      const cos = Math.cos(c.angle)
+      const sin = Math.sin(c.angle)
+      const corners = [
+        [-hw, -hh],
+        [hw, -hh],
+        [hw, hh],
+        [-hw, hh],
+      ]
+      const pts: number[] = []
+      for (const [lx, ly] of corners) {
+        pts.push(c.cx + cos * lx! - sin * ly!, c.cy + sin * lx! + cos * ly!)
+      }
+      const density = c.totalMass / Math.max(4 * hw * hh, 1e-6)
+      const colour = density < 1000 ? 0xc99a5b : 0x8792a0
+      g.poly(pts).fill(colour)
+      g.poly(pts).stroke({ width: 0.08, color: 0x2f3944, alpha: 0.7 })
+    }
+
     if (!this.showNodes) return
     const palive = p.slots.alive
     for (let i = 0; i < p.highWater; i++) {

@@ -45,7 +45,7 @@ export class FluidSolver {
   surfaceTensionK = 1e-4
   surfaceTensionN = 4
 
-  private readonly hash = new SpatialHash()
+  readonly hash = new SpatialHash()
   private density = new Float32Array(0)
   private lambda = new Float32Array(0)
   private dpx = new Float32Array(0)
