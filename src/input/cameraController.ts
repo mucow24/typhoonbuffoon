@@ -6,8 +6,10 @@ export interface ViewSize {
 }
 
 /**
- * Pan and zoom. Left-drag pans for now; once build tools exist they claim the
- * left button and `panWithLeft` goes false, leaving middle-drag and space-drag.
+ * Pan and zoom. Left-drag pans until the build tools claim the left button, at
+ * which point `panWithLeft` goes false and panning is middle-drag or the
+ * dedicated pan tool. Space is deliberately NOT a pan modifier - it is the
+ * play/pause key.
  */
 export class CameraController {
   panWithLeft = true
@@ -16,7 +18,6 @@ export class CameraController {
   private dragButton = -1
   private lastX = 0
   private lastY = 0
-  private spaceHeld = false
   private readonly disposers: (() => void)[] = []
 
   constructor(
@@ -29,8 +30,6 @@ export class CameraController {
     this.on(window, 'pointerup', this.onPointerUp as EventListener)
     this.on(element, 'wheel', this.onWheel as EventListener, { passive: false })
     this.on(element, 'contextmenu', this.onContextMenu as EventListener)
-    this.on(window, 'keydown', this.onKeyDown as EventListener)
-    this.on(window, 'keyup', this.onKeyUp as EventListener)
   }
 
   private on(
@@ -55,7 +54,7 @@ export class CameraController {
 
   private canPanWith(button: number): boolean {
     if (button === 1) return true // middle always pans
-    if (button === 0) return this.panWithLeft || this.spaceHeld
+    if (button === 0) return this.panWithLeft
     return false
   }
 
@@ -101,13 +100,5 @@ export class CameraController {
 
   private onContextMenu = (e: Event): void => {
     e.preventDefault()
-  }
-
-  private onKeyDown = (e: KeyboardEvent): void => {
-    if (e.code === 'Space') this.spaceHeld = true
-  }
-
-  private onKeyUp = (e: KeyboardEvent): void => {
-    if (e.code === 'Space') this.spaceHeld = false
   }
 }

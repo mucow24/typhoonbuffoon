@@ -44,7 +44,10 @@ export class Game {
   readonly session: Session
   readonly editor: EditorController
 
+  /** Starts paused: you build first, then run it. */
+  paused = true
   private breakCount = 0
+  private playButton: HTMLButtonElement | null = null
   private budgetLabel: HTMLDivElement | null = null
   private toolChoice: Choice<ToolName> | null = null
 
@@ -72,8 +75,8 @@ export class Game {
       this.session,
       this.field,
     )
-    // Build tools claim the left button; panning falls back to middle-drag and
-    // space-drag, as the camera controller was written to expect.
+    // Build tools claim the left button, so panning is middle-drag or the
+    // dedicated pan tool. Space is the play/pause key, not a pan modifier.
     this.cameraController.panWithLeft = false
     this.editorView = new EditorView(renderer.world, this.session, this.editor)
 
@@ -87,6 +90,14 @@ export class Game {
     this.camera.fitWidth(this.field.widthM, renderer.width)
     this.camera.y = 6
     renderer.app.renderer.on('resize', () => this.scenery.invalidate())
+
+    window.addEventListener('keydown', (e) => {
+      if ((e.target as HTMLElement)?.tagName === 'INPUT') return
+      if (e.code === 'Space') {
+        e.preventDefault()
+        this.togglePause()
+      }
+    })
 
     this.hud = new DebugOverlay()
     const buildPanel = this.buildBuildPanel()
@@ -107,6 +118,7 @@ export class Game {
     this.hud
       .add('frame', () => `${this.loop.stats.smoothedFrameMs.toFixed(1)} ms`)
       .add('fps', () => `${(1000 / Math.max(this.loop.stats.smoothedFrameMs, 0.001)).toFixed(0)}`)
+      .add('state', () => (this.paused ? 'PAUSED' : 'running'))
       .add('substeps', () => String(this.sim.substeps))
       .add('field', () => `${this.field.widthM.toFixed(0)} m`)
       .add('particles', () => String(this.sim.particles.count))
@@ -232,10 +244,11 @@ export class Game {
     button(panel.body, 'clear build', () => this.session.clearBuild())
 
     panel.section('session')
-    button(panel.body, 'play (snapshot)', () => this.session.play())
+    this.playButton = button(panel.body, 'play (space)', () => this.togglePause())
     button(panel.body, 'reset to snapshot', () => {
       this.session.reset()
       this.breakCount = 0
+      this.setPaused(true)
     })
 
     panel.section('level')
@@ -266,7 +279,7 @@ export class Game {
     button(panel.body, 'load test', () => this.loadProbe('loadtest'))
     button(panel.body, 'palm', () => this.loadProbe('palm'))
 
-    panel.note('middle-drag or space-drag to pan')
+    panel.note('middle-drag to pan, or the pan tool (5)')
     return panel
   }
 
@@ -452,7 +465,24 @@ export class Game {
 
   // -------------------------------------------------------------- loop hooks
 
+  /**
+   * Pause freezes the simulation only. Rendering, the camera and every build
+   * tool keep working, because building while paused is the normal way to lay
+   * a structure out - gravity yanking each piece the moment you place it is not
+   * a useful editor.
+   */
+  setPaused(paused: boolean): void {
+    this.paused = paused
+  }
+
+  togglePause(): void {
+    // First unpause doubles as Play: take the snapshot Reset restores to.
+    if (this.paused && !this.session.running) this.session.play()
+    this.paused = !this.paused
+  }
+
   private fixedUpdate(dt: number): void {
+    if (this.paused) return
     this.conditions.update(dt)
     this.sim.step(dt)
     if (this.sim.breakEvents.length > 0) {
@@ -471,6 +501,10 @@ export class Game {
     this.hud.update()
     this.updateBudgetLabel()
     if (this.toolChoice) this.toolChoice.set(this.editor.tool)
+    if (this.playButton) {
+      const label = this.paused ? 'play (space)' : 'pause (space)'
+      if (this.playButton.textContent !== label) this.playButton.textContent = label
+    }
   }
 
   private updateBudgetLabel(): void {
