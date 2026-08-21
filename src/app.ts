@@ -5,11 +5,14 @@ import { createRenderer, type Renderer } from './render/app'
 import { Camera } from './render/camera'
 import { Scenery } from './render/scenery'
 import { SimView } from './render/simView'
-import { buildBeam, buildChain } from './scenes/demos'
+import { buildBeam, buildChain, buildLoadTest } from './scenes/demos'
+import { materialAt, type MaterialId } from './sim/materials'
 import { SimWorld } from './sim/world'
 import { DebugOverlay } from './ui/debug'
 import { Choice, NumberField, Panel, Slider, button } from './ui/controls'
 import { Field } from './world/field'
+
+type SceneName = 'loadtest' | 'cantilever' | 'palm' | 'chain'
 
 /**
  * Composition root. Owns the renderer, the fixed-timestep loop and the sim, and
@@ -27,13 +30,13 @@ export class Game {
   readonly sim: SimWorld
   readonly simView: SimView
 
-  /** Tuning state for the probe scenes. */
-  private probeCompliance = 1e-7
-  private probeZeta = 0.9
-  private flexEI = 4e6
-  private bendZeta = 0.9
-  private segments = 6
-  private sceneName: 'cantilever' | 'palm' | 'chain' = 'cantilever'
+  materialId: MaterialId = 'wood'
+  segments = 0 // 0 means derive from the material
+  tipMassKg = 0
+  sceneName: SceneName = 'loadtest'
+
+  /** Breakages since the last scene reset, for the HUD. */
+  private breakCount = 0
 
   private constructor(renderer: Renderer) {
     this.renderer = renderer
@@ -60,7 +63,8 @@ export class Game {
 
     this.hud = new DebugOverlay()
     this.buildFieldPanel()
-    this.buildSimPanel()
+    this.buildSolverPanel()
+    this.buildScenePanel()
     this.rebuildScene()
 
     this.loop = new GameLoop({
@@ -72,18 +76,42 @@ export class Game {
     this.hud
       .add('frame', () => `${this.loop.stats.smoothedFrameMs.toFixed(1)} ms`)
       .add('fps', () => `${(1000 / Math.max(this.loop.stats.smoothedFrameMs, 0.001)).toFixed(0)}`)
-      .add('steps/frame', () => String(this.loop.stats.stepsLastFrame))
       .add('substeps', () => String(this.sim.substeps))
       .add('sim time', () => `${this.loop.stats.simTime.toFixed(1)} s`)
       .add('field', () => `${this.field.widthM.toFixed(0)} m`)
       .add('zoom', () => `${this.camera.zoom.toFixed(2)}x`)
       .add('particles', () => String(this.sim.particles.count))
-      .add('constraints', () => String(this.sim.distance.count))
+      .add('members', () => String(this.sim.distance.count))
       .add('bends', () => String(this.sim.bend.count))
+      .add('peak load', () => `${(this.peakLoad() * 100).toFixed(0)}%`)
+      .add('max damage', () => `${(this.maxDamage() * 100).toFixed(0)}%`)
+      .add('broken', () => String(this.breakCount))
   }
 
   static async create(): Promise<Game> {
     return new Game(await createRenderer())
+  }
+
+  /** Highest fraction-of-break-threshold across all live members. */
+  peakLoad(): number {
+    const d = this.sim.distance
+    let peak = 0
+    for (let i = 0; i < d.highWater; i++) {
+      if (d.slots.alive[i] !== 1) continue
+      const m = materialAt(d.material[i]!)
+      if (m.breakStrain <= 0) continue
+      peak = Math.max(peak, Math.abs(d.strain[i]!) / m.breakStrain)
+    }
+    return peak
+  }
+
+  maxDamage(): number {
+    const d = this.sim.distance
+    let peak = 0
+    for (let i = 0; i < d.highWater; i++) {
+      if (d.slots.alive[i] === 1) peak = Math.max(peak, d.damage[i]!)
+    }
+    return peak
   }
 
   private fitView(): void {
@@ -94,7 +122,6 @@ export class Game {
 
   private buildFieldPanel(): void {
     const panel = new Panel({ title: 'field', side: 'left', width: 205 })
-
     new NumberField(panel.body, {
       label: 'width',
       value: this.field.widthM,
@@ -106,26 +133,13 @@ export class Game {
         this.fitView()
       },
     })
-
     button(panel.body, 'fit view', () => this.fitView())
     panel.note('drag to pan, wheel to zoom')
   }
 
-  private buildSimPanel(): void {
+  private buildSolverPanel(): void {
     const panel = new Panel({ title: 'solver', side: 'left', width: 205 })
     panel.root.style.top = '150px'
-
-    new Slider(panel.body, {
-      label: 'global damping',
-      min: 0,
-      max: 2,
-      step: 0.05,
-      value: this.sim.linearDamping,
-      format: (v) => `${v.toFixed(2)}/s`,
-      onInput: (v) => {
-        this.sim.linearDamping = v
-      },
-    })
 
     new Slider(panel.body, {
       label: 'substeps',
@@ -139,83 +153,41 @@ export class Game {
       },
     })
 
-    // Compliance spans orders of magnitude, so the slider is the exponent.
     new Slider(panel.body, {
-      label: 'compliance',
-      min: -9,
-      max: -2,
-      step: 0.1,
-      value: Math.log10(this.probeCompliance),
-      format: (v) => `1e${v.toFixed(1)}`,
-      onInput: (v) => {
-        this.probeCompliance = Math.pow(10, v)
-        this.sim.distance.compliance.fill(this.probeCompliance, 0, this.sim.distance.highWater)
-      },
-    })
-
-    new Slider(panel.body, {
-      label: 'axial zeta',
+      label: 'global damping',
       min: 0,
       max: 2,
       step: 0.05,
-      value: this.probeZeta,
-      format: (v) => v.toFixed(2),
+      value: this.sim.linearDamping,
+      format: (v) => `${v.toFixed(2)}/s`,
       onInput: (v) => {
-        this.probeZeta = v
-        this.sim.distance.zeta.fill(v, 0, this.sim.distance.highWater)
+        this.sim.linearDamping = v
       },
     })
+  }
 
-    panel.section('bending')
+  private buildScenePanel(): void {
+    const panel = new Panel({ title: 'probe', side: 'left', width: 205 })
+    panel.root.style.top = '272px'
 
-    // Flexural rigidity rather than raw compliance: the joint compliance is
-    // derived as segmentLength/EI, so the material keeps its meaning when the
-    // segment count changes.
-    new Slider(panel.body, {
-      label: 'stiffness EI',
-      min: 5,
-      max: 8.5,
-      step: 0.1,
-      value: Math.log10(this.flexEI),
-      format: (v) => `1e${v.toFixed(1)}`,
-      onInput: (v) => {
-        this.flexEI = Math.pow(10, v)
+    new Choice<MaterialId>(panel.body, {
+      label: 'material',
+      value: this.materialId,
+      options: [
+        { value: 'wood', label: 'wood' },
+        { value: 'steel', label: 'steel' },
+      ],
+      onChange: (v) => {
+        this.materialId = v
         this.rebuildScene()
       },
     })
 
-    new Slider(panel.body, {
-      label: 'bend zeta',
-      min: 0,
-      max: 2,
-      step: 0.05,
-      value: this.bendZeta,
-      format: (v) => v.toFixed(2),
-      onInput: (v) => {
-        this.bendZeta = v
-        this.sim.bend.zeta.fill(v, 0, this.sim.bend.highWater)
-      },
-    })
-
-    new Slider(panel.body, {
-      label: 'segments',
-      min: 1,
-      max: 12,
-      step: 1,
-      value: this.segments,
-      format: (v) => v.toFixed(0),
-      onInput: (v) => {
-        this.segments = v
-        this.rebuildScene()
-      },
-    })
-
-    panel.section('scene')
-
-    new Choice(panel.body, {
-      label: 'probe',
+    new Choice<SceneName>(panel.body, {
+      label: 'scene',
       value: this.sceneName,
       options: [
+        { value: 'loadtest', label: 'load test' },
         { value: 'cantilever', label: 'cantilever' },
         { value: 'palm', label: 'palm' },
         { value: 'chain', label: 'chain' },
@@ -226,50 +198,96 @@ export class Game {
       },
     })
 
+    new Slider(panel.body, {
+      label: 'segments',
+      min: 0,
+      max: 12,
+      step: 1,
+      value: this.segments,
+      format: (v) => (v === 0 ? 'auto' : v.toFixed(0)),
+      onInput: (v) => {
+        this.segments = v
+        this.rebuildScene()
+      },
+    })
+
+    new Slider(panel.body, {
+      label: 'tip load',
+      min: 0,
+      max: 60000,
+      step: 500,
+      value: this.tipMassKg,
+      format: (v) => `${(v / 1000).toFixed(1)} t`,
+      onInput: (v) => {
+        this.tipMassKg = v
+        this.rebuildScene()
+      },
+    })
+
     button(panel.body, 'reset scene', () => this.rebuildScene())
+    panel.note('material constants live in sim/materials.ts')
   }
 
   /** Rebuild the sim from scratch. Cheap, and keeps reset honest. */
   rebuildScene(): void {
     this.sim.clear()
+    this.breakCount = 0
+
     const t = this.field.terrain
     const x = t.x0 + this.field.widthM * 0.22
-    const common = {
-      segments: this.segments,
-      axialCompliance: this.probeCompliance,
-      flexuralRigidity: this.flexEI,
-      zetaAxial: this.probeZeta,
-      zetaBend: this.bendZeta,
-    }
+    const segments = this.segments > 0 ? this.segments : undefined
 
     switch (this.sceneName) {
       case 'chain':
-        buildChain(this.sim, {
-          x,
-          y: t.maxHeight + 16,
-          links: 14,
-          spacing: 0.9,
-          compliance: this.probeCompliance,
-          zeta: this.probeZeta,
-        })
+        buildChain(this.sim, { x, y: t.maxHeight + 16, links: 14, spacing: 0.9 })
         break
 
       case 'cantilever': {
         const y = t.heightAt(x) + 14
-        buildBeam(this.sim, { ...common, x0: x, y0: y, x1: x + 12, y1: y, clampStart: true })
+        buildBeam(this.sim, {
+          x0: x,
+          y0: y,
+          x1: x + 12,
+          y1: y,
+          material: this.materialId,
+          segments,
+          clampStart: true,
+        })
         break
       }
 
       case 'palm': {
         const y = t.heightAt(x)
-        buildBeam(this.sim, { ...common, x0: x, y0: y, x1: x, y1: y + 13, clampStart: true })
+        buildBeam(this.sim, {
+          x0: x,
+          y0: y,
+          x1: x,
+          y1: y + 13,
+          material: this.materialId,
+          segments,
+          clampStart: true,
+        })
         break
       }
+
+      case 'loadtest':
+        buildLoadTest(this.sim, {
+          x,
+          y: t.heightAt(x) + 14,
+          material: this.materialId,
+          segments,
+          tipMassKg: this.tipMassKg,
+        })
+        break
     }
   }
 
   private fixedUpdate(dt: number): void {
     this.sim.step(dt)
+    if (this.sim.breakEvents.length > 0) {
+      this.breakCount += this.sim.breakEvents.length
+      this.sim.breakEvents.length = 0
+    }
   }
 
   private render(_alpha: number): void {

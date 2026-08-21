@@ -1,7 +1,17 @@
 import type { Terrain } from '../world/terrain'
 import { BendConstraints } from './constraints/bending'
 import { DistanceConstraints } from './constraints/distance'
+import { materialAt } from './materials'
 import { ParticleStore } from './particles'
+
+export interface BreakEvent {
+  a: number
+  b: number
+  strain: number
+  x: number
+  y: number
+  material: number
+}
 
 export interface SimStats {
   substeps: number
@@ -41,6 +51,8 @@ export class SimWorld {
    */
   linearDamping = 0.35
   terrain: Terrain | null = null
+  /** Drained by the renderer each frame for splinters and sound. */
+  readonly breakEvents: BreakEvent[] = []
 
   step(dt: number): void {
     const h = dt / this.substeps
@@ -61,6 +73,7 @@ export class SimWorld {
       this.applyGroundFriction()
     }
     this.clearAccelerations()
+    this.updateDamage(dt)
   }
 
   private predict(h: number): void {
@@ -143,10 +156,86 @@ export class SimWorld {
     p.accY.fill(0, 0, p.highWater)
   }
 
+  /**
+   * Damage, plastic set, and breakage. Runs once per frame rather than per
+   * substep - these are slow, irreversible processes, not part of the solve.
+   *
+   * Damage and plasticity are deliberately separate. Damage is a scalar that
+   * lowers the break threshold and changes no geometry; it applies to every
+   * material and is what makes a long siege feel like it is being lost.
+   * Plastic set actually moves the rest length, and only steel does it - wood
+   * is near-linear-elastic to fracture and never takes a set.
+   */
+  updateDamage(dt: number): void {
+    const d = this.distance
+    const alive = d.slots.alive
+    const n = d.highWater
+
+    for (let i = 0; i < n; i++) {
+      if (alive[i] !== 1) continue
+      const m = materialAt(d.material[i]!)
+      const signed = d.strain[i]!
+      const s = Math.abs(signed)
+
+      const load = m.breakStrain > 0 ? s / m.breakStrain : 0
+      if (load > m.damageOnset && m.damageOnset < 1) {
+        const over = (load - m.damageOnset) / (1 - m.damageOnset)
+        d.damage[i] = Math.min(0.9, d.damage[i]! + m.damageRate * over * over * dt)
+      }
+
+      // Permanent set past yield. Wood's yieldStrain is Infinity, so this is
+      // not merely disabled for wood - it never executes.
+      if (m.plasticRate > 0 && s > m.yieldStrain) {
+        const excess = signed - Math.sign(signed) * m.yieldStrain
+        d.rest[i]! += d.rest[i]! * excess * m.plasticRate * dt
+      }
+
+      if (s > m.breakStrain * (1 - d.damage[i]!)) {
+        this.breakConstraint(i, signed)
+      }
+    }
+  }
+
+  private breakConstraint(i: number, strain: number): void {
+    const d = this.distance
+    const p = this.particles
+    const ia = d.a[i]!
+    const ib = d.b[i]!
+
+    this.breakEvents.push({
+      a: ia,
+      b: ib,
+      strain,
+      x: (p.posX[ia]! + p.posX[ib]!) * 0.5,
+      y: (p.posY[ia]! + p.posY[ib]!) * 0.5,
+      material: d.material[i]!,
+    })
+
+    d.destroy(i)
+    this.severBendsSpanning(ia, ib)
+  }
+
+  /** A severed link cannot carry a bending moment across itself. */
+  private severBendsSpanning(ia: number, ib: number): void {
+    const b = this.bend
+    const alive = b.slots.alive
+    for (let j = 0; j < b.highWater; j++) {
+      if (alive[j] !== 1) continue
+      const x = b.a[j]!
+      const y = b.b[j]!
+      const z = b.c[j]!
+      if ((x === ia && y === ib) || (y === ia && x === ib) ||
+          (y === ia && z === ib) || (z === ia && y === ib)) {
+        b.destroy(j)
+      }
+    }
+  }
+
   clear(): void {
     this.particles.clear()
     this.distance.clear()
     this.bend.clear()
+    this.breakEvents.length = 0
   }
 
   stats(): SimStats {

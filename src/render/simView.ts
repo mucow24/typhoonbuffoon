@@ -1,19 +1,48 @@
 import { Container, Graphics } from 'pixi.js'
+import { clamp, lerp } from '../core/math'
+import { materialAt } from '../sim/materials'
 import type { SimWorld } from '../sim/world'
 import type { Camera } from './camera'
 
+const mixRgb = (a: number, b: number, t: number): number => {
+  const ar = (a >> 16) & 0xff
+  const ag = (a >> 8) & 0xff
+  const ab = a & 0xff
+  const br = (b >> 16) & 0xff
+  const bg = (b >> 8) & 0xff
+  const bb = b & 0xff
+  return (
+    (Math.round(lerp(ar, br, t)) << 16) |
+    (Math.round(lerp(ag, bg, t)) << 8) |
+    Math.round(lerp(ab, bb, t))
+  )
+}
+
+const STRESS_MID = 0xf2c14e
+const STRESS_HIGH = 0xe2483c
+const DAMAGE_DARK = 0x3a2b22
+
 /**
- * Draws the simulated structure in world space. Redrawn every frame - the
- * geometry is entirely dynamic, so retained-mode display objects would buy
- * nothing.
+ * Stress colouring: the genre's core legibility device, and doubly important
+ * here because failure unfolds over a long storm rather than in one snap.
+ *
+ * The material's own colour is kept at low load so wood and steel stay
+ * distinguishable, then blended toward amber and red as the member approaches
+ * its break threshold. Accumulated damage darkens it permanently, so a member
+ * that has been overloaded and survived still reads as compromised.
  */
+export function stressColour(base: number, load: number, damage: number): number {
+  const l = clamp(load, 0, 1)
+  const hot = l < 0.5 ? mixRgb(base, STRESS_MID, l * 2) : mixRgb(STRESS_MID, STRESS_HIGH, (l - 0.5) * 2)
+  return mixRgb(hot, DAMAGE_DARK, clamp(damage, 0, 1) * 0.55)
+}
+
 export class SimView {
   readonly container = new Container()
   private readonly g = new Graphics()
 
-  /** Line half-width in metres for constraint rendering. */
-  memberThickness = 0.18
   showNodes = true
+  showStress = true
 
   constructor(
     parent: Container,
@@ -39,9 +68,15 @@ export class SimView {
       if (alive[i] !== 1) continue
       const ia = d.a[i]!
       const ib = d.b[i]!
+      const mat = materialAt(d.material[i]!)
+      const load = mat.breakStrain > 0 ? Math.abs(d.strain[i]!) / mat.breakStrain : 0
+      const colour = this.showStress
+        ? stressColour(mat.colour, load, d.damage[i]!)
+        : mat.colour
+
       g.moveTo(p.posX[ia]!, p.posY[ia]!)
       g.lineTo(p.posX[ib]!, p.posY[ib]!)
-      g.stroke({ width: this.memberThickness, color: 0xd7c9a8, cap: 'round' })
+      g.stroke({ width: mat.section, color: colour, cap: 'round' })
     }
 
     if (!this.showNodes) return
@@ -49,8 +84,8 @@ export class SimView {
     for (let i = 0; i < p.highWater; i++) {
       if (palive[i] !== 1) continue
       const pinned = p.invMass[i] === 0
-      g.circle(p.posX[i]!, p.posY[i]!, pinned ? 0.28 : 0.16)
-      g.fill(pinned ? 0xff9d5c : 0x6fd3ff)
+      g.circle(p.posX[i]!, p.posY[i]!, pinned ? 0.26 : 0.13)
+      g.fill(pinned ? 0xff9d5c : 0x2f3944)
     }
   }
 }

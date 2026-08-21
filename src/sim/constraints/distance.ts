@@ -9,6 +9,8 @@ export interface DistanceSpec {
   compliance: number
   /** Damping ratio, as a fraction of critical. ~0.8-1.0 settles without ringing. */
   zeta: number
+  /** Index into MATERIAL_IDS. */
+  material?: number
 }
 
 /**
@@ -30,6 +32,10 @@ export class DistanceConstraints {
   lambda: Float32Array
   /** (length - rest) / rest from the most recent solve. Drives colour and damage. */
   strain: Float32Array
+  /** Index into MATERIAL_IDS. */
+  material: Uint8Array
+  /** Accumulated, irreversible. Lowers the effective break threshold. */
+  damage: Float32Array
 
   constructor(capacity = 2048) {
     this.slots = new SlotAllocator(capacity)
@@ -40,6 +46,8 @@ export class DistanceConstraints {
     this.zeta = new Float32Array(capacity)
     this.lambda = new Float32Array(capacity)
     this.strain = new Float32Array(capacity)
+    this.material = new Uint8Array(capacity)
+    this.damage = new Float32Array(capacity)
     this.slots.onGrow = (cap) => this.grow(cap)
   }
 
@@ -51,6 +59,8 @@ export class DistanceConstraints {
     this.zeta = SlotAllocator.growF32(this.zeta, cap)
     this.lambda = SlotAllocator.growF32(this.lambda, cap)
     this.strain = SlotAllocator.growF32(this.strain, cap)
+    this.material = SlotAllocator.growU8(this.material, cap)
+    this.damage = SlotAllocator.growF32(this.damage, cap)
   }
 
   get count(): number {
@@ -74,6 +84,8 @@ export class DistanceConstraints {
     this.zeta[i] = spec.zeta
     this.lambda[i] = 0
     this.strain[i] = 0
+    this.material[i] = spec.material ?? 0
+    this.damage[i] = 0
     return i
   }
 
