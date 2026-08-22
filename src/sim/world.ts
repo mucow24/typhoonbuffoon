@@ -6,7 +6,7 @@ import { FluidSolver } from './fluid'
 import { WaterField } from './water'
 import { AIR_DENSITY, WindField } from './wind'
 import { materialAt } from './materials'
-import { KIND_FLUID, ParticleStore } from './particles'
+import { KIND_FLUID, KIND_OBJECT, ParticleStore } from './particles'
 import { Rng } from '../core/rng'
 
 export interface BreakEvent {
@@ -88,8 +88,6 @@ export class SimWorld {
   waterDrag = 2.2
   /** Fraction of a contact penetration resolved per substep. */
   contactRelaxation = 0.35
-  /** Per-contact damping of a hull moving into fluid, 0..1. */
-  objectContactDrag = 0.05
   /** How much of the inbound normal velocity a contact removes, 0..1. */
   contactNormalDamping = 0.6
   /**
@@ -145,7 +143,6 @@ export class SimWorld {
       this.fluid.project(this.particles, h)
       this.beginContacts()
       this.solveFluidAgainstMembers()
-      this.solveFluidAgainstObjects()
       this.resolveContacts()
       this.solveContacts()
       this.updateVelocities(h)
@@ -304,6 +301,10 @@ export class SimWorld {
     for (let i = 0; i < p.highWater; i++) {
       if (alive[i] !== 1 || p.invMass[i] === 0) continue
       if (p.kind[i] === KIND_FLUID) continue
+      // Objects get their buoyancy from the pressure field now - they take part
+      // in the density estimate, so the water lifts them directly. Applying the
+      // analytic term as well would count it twice.
+      if (p.kind[i] === KIND_OBJECT) continue
       const vol = p.volume[i]!
       if (vol <= 0) continue
 
@@ -417,103 +418,6 @@ export class SimWorld {
             this.contactDX[j]! += nx * push
             this.contactDY[j]! += ny * push
             this.contactHits[j]!++
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * Fluid against object cluster particles.
-   *
-   * Without this, water flows straight through a crate: the object displaces
-   * nothing, so the height field reads water where the hull is, buoyancy is
-   * computed against a surface the object itself should have raised, and the
-   * result is a crate that launches. Objects have no distance constraints, so
-   * they are not covered by the member pass and need their own.
-   */
-  private solveFluidAgainstObjects(): void {
-    const p = this.particles
-    if (this.clusters.length === 0) return
-    const hash = this.fluid.hash
-    const starts = hash.starts
-    const entries = hash.entries
-    const scratch = hash.scratch
-
-    for (const c of this.clusters) {
-      if (!c.alive) continue
-      for (let k = 0; k < c.particles.length; k++) {
-        const i = c.particles[k]!
-        if (p.slots.alive[i] !== 1) continue
-        const xi = p.posX[i]!
-        const yi = p.posY[i]!
-        const ri = p.radius[i]!
-
-        const buckets = hash.collectBuckets(xi, yi)
-        for (let s = 0; s < buckets; s++) {
-          const b = scratch[s]!
-          const end = starts[b + 1]!
-          for (let q = starts[b]!; q < end; q++) {
-            const j = entries[q]!
-            if (p.slots.alive[j] !== 1) continue
-            const wj = p.invMass[j]!
-            if (wj <= 0) continue
-
-            let nx = p.posX[j]! - xi
-            let ny = p.posY[j]! - yi
-            const dist = Math.sqrt(nx * nx + ny * ny)
-            const minDist = ri + p.radius[j]!
-            if (dist >= minDist) continue
-
-            if (dist < 1e-6) {
-              nx = 0
-              ny = 1
-            } else {
-              nx /= dist
-              ny /= dist
-            }
-
-            // TWO-WAY, mass weighted. One-way displacement is an energy source
-            // with no reaction: shoving fluid aside changes the density field,
-            // the pressure solver answers, and that becomes velocity the object
-            // never paid for. Water around a floating house then never settled -
-            // it plateaued near 5 m/s however hard anything was damped.
-            //
-            // The object's share is small because it is far heavier per
-            // particle, so this is a reaction, not a second buoyancy.
-            const pen = Math.min(minDist - dist, this.maxContactCorrection)
-            const push = pen * this.contactRelaxation
-            this.contactDX[j]! += nx * push
-            this.contactDY[j]! += ny * push
-            this.contactHits[j]!++
-
-            // The object's half of the interaction is DISSIPATIVE ONLY: damp
-            // the hull's motion into the fluid, never push it back.
-            //
-            // Two-way mass-weighted contact was tried and measured. It settles
-            // the water better but destroys buoyancy: with it, steel rests at
-            // cy -0.53 instead of sinking to -4.76, because non-penetration is
-            // not buoyancy - the object takes no part in the density field, so
-            // density stops deciding whether things float. Making that work
-            // needs the object sampled as boundary particles contributing to
-            // fluid density (Akinci et al.), which is a real piece of work and
-            // not a flag.
-            //
-            // A positional reaction is the physically complete answer and it
-            // does settle the water, but it also lifts - and the analytic
-            // buoyancy is already providing lift, so boxes float far too high
-            // and steel refuses to sink. Draining the energy instead removes
-            // the free work that shoving fluid aside was doing, which is the
-            // part that kept the water alive, without adding a second buoyancy.
-            if (p.invMass[i]! > 0) {
-              const rix = p.posX[i]! - p.prevX[i]!
-              const riy = p.posY[i]! - p.prevY[i]!
-              const vin = rix * nx + riy * ny
-              if (vin > 0) {
-                p.prevX[i]! += nx * vin * this.objectContactDrag
-                p.prevY[i]! += ny * vin * this.objectContactDrag
-              }
-            }
           }
         }
       }
@@ -719,7 +623,10 @@ export class SimWorld {
 
   /** Add a rectangular physics object. Returns its cluster. */
   addObject(spec: ObjectSpec): Cluster {
-    const c = buildObject(this.particles, spec)
+    // Sampled at the fluid's own resolution unless told otherwise. Coarser than
+    // that and water simply flows between the object's particles: the density
+    // estimate never sees a solid, so nothing floats.
+    const c = buildObject(this.particles, { spacing: this.fluid.spacing, ...spec })
     this.clusters.push(c)
     return c
   }

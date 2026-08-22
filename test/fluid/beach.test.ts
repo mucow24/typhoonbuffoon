@@ -37,21 +37,7 @@ function beachWorld(spacing = 0.35, widthM = 120) {
 }
 
 describe('water on the generated beach', () => {
-  /**
-   * KNOWN UNMET. Marked `fails` so it stays visible and flips red the moment
-   * someone fixes it, rather than being quietly relaxed to green.
-   *
-   * Water around a floating object settles to about 2.7 m/s instead of the 1.2
-   * the empty scene reaches. The cause is understood: fluid-to-object coupling
-   * is one-way, so displacing water is free work the hull never pays for, and
-   * the pressure solver turns that displacement into velocity. The complete
-   * answer is a positional reaction, which does settle the water - but it also
-   * lifts, and the analytic buoyancy already supplies lift, so boxes float far
-   * too high and steel will not sink. Fixing it properly means buoyancy
-   * emerging from contact pressure (boundary particles) rather than from the
-   * height field, which is a rewrite of the coupling, not a tuning pass.
-   */
-  it.fails('settles with a structure standing in it, as the seeded level has', () => {
+  it('settles with a structure standing in it, as the seeded level has', () => {
     // The app always has the house and its anchors present. Every other test in
     // this file pours water into an empty world, and the empty world settles
     // while the app plateaus around 3 m/s - so the object was the difference,
@@ -74,9 +60,9 @@ describe('water on the generated beach', () => {
   })
 
   it('does not get WORSE around a structure than it is today', () => {
-    // Ratchet on the known-unmet case above. It was 5.2 m/s before the
-    // dissipative hull reaction and 2.7 before the fluid viscosity was raised.
-    // Still not good; it must not slip back.
+    // Ratchet beside the case above. This was 5.2 m/s with one-way coupling,
+    // 2.7 after the dissipative hull reaction, and is now under 1.2 with
+    // buoyancy emerging from the pressure field. It must not slip back.
     const { sim, field } = beachWorld(0.35)
     const t = field.terrain
     const ground = t.heightAt(-8)

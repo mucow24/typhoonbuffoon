@@ -1,4 +1,4 @@
-import { KIND_FLUID, type ParticleStore } from './particles'
+import { KIND_FLUID, KIND_OBJECT, type ParticleStore } from './particles'
 import { SpatialHash } from './spatialHash'
 
 const MAX_NEIGHBOURS = 48
@@ -34,16 +34,12 @@ export class FluidSolver {
   /**
    * XSPH viscosity.
    *
-   * High compared with real water, deliberately. Water is nearly inviscid, so a
-   * physically faithful 60 m basin slosh persists for minutes - measured here at
-   * 1.6-2.0 m/s still going after 90 seconds, which reads on screen as water
-   * that never calms down. Damping the object or the whole system does not help
-   * (more hull drag actually made it worse, since a stiffer hull stirs harder).
-   * Damping the FLUID does: 0.05 -> 0.4 takes the residual from 2.7 to about 2.0, and 0.7 would take it
-   * below 1.2 but is gloopy enough that water no longer finds its own level
-   * across a barrier, which is a worse fault than slosh.
+   * Modest. An earlier version ran this at 0.4 to smother a residual slosh
+   * that turned out to be caused by one-way object coupling; once buoyancy came
+   * from the pressure field the slosh went with it, and the water can be thin
+   * again.
    */
-  viscosity = 0.4
+  viscosity = 0.1
   /**
    * Cap on the VELOCITY a density correction may imply, m/s.
    *
@@ -72,6 +68,10 @@ export class FluidSolver {
   private slot = new Int32Array(0)
   /** Number of live fluid particles in `density`/`lambda`, for the harness. */
   liveCount = 0
+  /** Reaction displacement owed to solid particles, applied with the fluid's. */
+  private solidDx = new Float32Array(0)
+  private solidDy = new Float32Array(0)
+  private readonly solidTouched: number[] = []
 
   /** Smoothing radius. Two particle spacings gives ~12 neighbours in 2D. */
   get h(): number {
@@ -114,6 +114,8 @@ export class FluidSolver {
     this.neighbours = new Int32Array(cap * MAX_NEIGHBOURS)
     this.indices = new Int32Array(cap)
     this.slot = new Int32Array(cap)
+    this.solidDx = new Float32Array(cap)
+    this.solidDy = new Float32Array(cap)
   }
 
   /** Poly6, 2D: 4/(pi h^8) (h^2 - r^2)^3 */
@@ -154,7 +156,10 @@ export class FluidSolver {
     for (let a = 0; a < live; a++) this.slot[this.indices[a]!] = a
 
     this.hash.setCellSize(h)
-    this.hash.build(p, 1 << KIND_FLUID)
+    // Solids are in the neighbour search now: an object that displaces water has
+    // to be visible to the density estimate, or pressure cannot act on it and
+    // buoyancy has to be bolted on from outside.
+    this.hash.build(p, (1 << KIND_FLUID) | (1 << KIND_OBJECT))
 
     // Neighbour lists, built once per frame and reused across projections.
     const posX = p.posX
@@ -198,7 +203,7 @@ export class FluidSolver {
     const h = this.h
     const h2 = h * h
     const poly6Coeff = 4 / (Math.PI * Math.pow(h, 8))
-    const spikyCoeff = (-30 / (Math.PI * Math.pow(h, 5))) * this.particleMass
+    const spikyCoeff2 = -30 / (Math.PI * Math.pow(h, 5))
     const mass = this.particleMass
     const rho0 = this.restDensity
     const invRho0 = 1 / rho0
@@ -214,6 +219,8 @@ export class FluidSolver {
     const posX = p.posX
     const posY = p.posY
     const invMass = p.invMass
+    const kind = p.kind
+    const volume = p.volume
     const idx = this.indices
     const nbr = this.neighbours
     const nbrStart = this.neighbourStart
@@ -244,11 +251,16 @@ export class FluidSolver {
           const r2 = dx * dx + dy * dy
           if (r2 >= h2) continue
           const d = h2 - r2
-          rho += poly6Coeff * d * d * d * mass
+
+          // A solid neighbour stands in for the water it displaces: its
+          // contribution is rho0 times the area it occupies (Akinci et al.),
+          // not the fluid particle mass.
+          const mj = kind[j] === KIND_OBJECT ? this.waterDensity * volume[j]! : mass
+          rho += poly6Coeff * d * d * d * mj
 
           const r = Math.sqrt(r2)
           if (r > 1e-9) {
-            const w = spikyCoeff * (h - r) * (h - r)
+            const w = spikyCoeff2 * (h - r) * (h - r) * mj
             const gx = ((w * dx) / r) * invRho0
             const gy = ((w * dy) / r) * invRho0
             gradIx += gx
@@ -289,9 +301,12 @@ export class FluidSolver {
           const r = Math.sqrt(r2)
           if (r <= 1e-9) continue
 
-          const lj = lambda[slot[j]!]!
+          const solid = kind[j] === KIND_OBJECT
+          // A solid carries no lambda of its own; the fluid's pressure acts on
+          // it and it answers with the reaction below.
+          const lj = solid ? 0 : lambda[slot[j]!]!
           let corr = 0
-          if (sCorrDenom > 1e-20) {
+          if (!solid && sCorrDenom > 1e-20) {
             const d = h2 - r2
             const ratio = (poly6Coeff * d * d * d) / sCorrDenom
             // surfaceTensionN is 4; a multiply chain beats Math.pow, which was
@@ -300,10 +315,22 @@ export class FluidSolver {
             corr = -stK * r2p * r2p
           }
 
-          const w = spikyCoeff * (h - r) * (h - r)
-          const s = (((li + lj + corr) * w) / r) * invRho0
-          dx0 += s * dx
-          dy0 += s * dy
+          const mj = solid ? this.waterDensity * volume[j]! : mass
+          const w = spikyCoeff2 * (h - r) * (h - r) * mj
+          const sc = (((li + lj + corr) * w) / r) * invRho0
+          dx0 += sc * dx
+          dy0 += sc * dy
+
+          if (solid && invMass[j]! > 0) {
+            // Newton's third law. The solid's share is set by the mass ratio,
+            // so a light body is shoved hard by the water it displaces and a
+            // dense one barely moves - which IS buoyancy, rather than a force
+            // applied alongside it.
+            const ratioM = invMass[j]! / Math.max(invMass[i]!, 1e-12)
+            if (this.solidDx[j] === 0 && this.solidDy[j] === 0) this.solidTouched.push(j)
+            this.solidDx[j]! -= sc * dx * ratioM
+            this.solidDy[j]! -= sc * dy * ratioM
+          }
         }
 
         const mag = Math.sqrt(dx0 * dx0 + dy0 * dy0)
@@ -322,6 +349,22 @@ export class FluidSolver {
         posX[i]! += dpx[a]!
         posY[i]! += dpy[a]!
       }
+
+      for (const j of this.solidTouched) {
+        let sx = this.solidDx[j]!
+        let sy = this.solidDy[j]!
+        const mag = Math.sqrt(sx * sx + sy * sy)
+        if (mag > maxCorr) {
+          const k2 = maxCorr / mag
+          sx *= k2
+          sy *= k2
+        }
+        posX[j]! += sx
+        posY[j]! += sy
+        this.solidDx[j] = 0
+        this.solidDy[j] = 0
+      }
+      this.solidTouched.length = 0
     }
   }
 
