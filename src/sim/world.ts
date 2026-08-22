@@ -490,6 +490,15 @@ export class SimWorld {
             // The object's half of the interaction is DISSIPATIVE ONLY: damp
             // the hull's motion into the fluid, never push it back.
             //
+            // Two-way mass-weighted contact was tried and measured. It settles
+            // the water better but destroys buoyancy: with it, steel rests at
+            // cy -0.53 instead of sinking to -4.76, because non-penetration is
+            // not buoyancy - the object takes no part in the density field, so
+            // density stops deciding whether things float. Making that work
+            // needs the object sampled as boundary particles contributing to
+            // fluid density (Akinci et al.), which is a real piece of work and
+            // not a flag.
+            //
             // A positional reaction is the physically complete answer and it
             // does settle the water, but it also lifts - and the analytic
             // buoyancy is already providing lift, so boxes float far too high
