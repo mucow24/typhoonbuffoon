@@ -31,8 +31,19 @@ export class FluidSolver {
   iterations = 1
   /** Constraint force mixing, stops lambda blowing up in sparse regions. */
   relaxation = 1e-5
-  /** XSPH viscosity. Higher is gloopier and calmer. */
-  viscosity = 0.05
+  /**
+   * XSPH viscosity.
+   *
+   * High compared with real water, deliberately. Water is nearly inviscid, so a
+   * physically faithful 60 m basin slosh persists for minutes - measured here at
+   * 1.6-2.0 m/s still going after 90 seconds, which reads on screen as water
+   * that never calms down. Damping the object or the whole system does not help
+   * (more hull drag actually made it worse, since a stiffer hull stirs harder).
+   * Damping the FLUID does: 0.05 -> 0.4 takes the residual from 2.7 to about 2.0, and 0.7 would take it
+   * below 1.2 but is gloopy enough that water no longer finds its own level
+   * across a barrier, which is a worse fault than slosh.
+   */
+  viscosity = 0.4
   /**
    * Cap on the VELOCITY a density correction may imply, m/s.
    *

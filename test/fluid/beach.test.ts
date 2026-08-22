@@ -74,8 +74,9 @@ describe('water on the generated beach', () => {
   })
 
   it('does not get WORSE around a structure than it is today', () => {
-    // Ratchet on the known-unmet case above: 2.7 m/s is not good, but it was
-    // 5.2 before the dissipative hull reaction and it must not slip back.
+    // Ratchet on the known-unmet case above. It was 5.2 m/s before the
+    // dissipative hull reaction and 2.7 before the fluid viscosity was raised.
+    // Still not good; it must not slip back.
     const { sim, field } = beachWorld(0.35)
     const t = field.terrain
     const ground = t.heightAt(-8)
@@ -87,7 +88,7 @@ describe('water on the generated beach', () => {
     })
     expectFinite(trace)
     expectNoEscapes(trace, 'water around a structure')
-    expectSettles(trace, { below: 3.5, maxBelow: 12, byFraction: 0.75, label: 'water around a structure' })
+    expectSettles(trace, { below: 2.5, maxBelow: 12, byFraction: 0.75, label: 'water around a structure' })
   })
 
   it('settles after a large dump from height, as the sandbox tool does', () => {

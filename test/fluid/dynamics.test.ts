@@ -77,7 +77,9 @@ describe('hydrostatics', () => {
 
     // All the water starts on the left.
     fillWater(sim, { x0: -13, x1: -1, yTop: 5 })
-    settle(sim, 30)
+    // Longer than it looks like it needs: the fluid carries real viscosity, so
+    // equalising across a sill is a slow process rather than an instant one.
+    settle(sim, 90)
 
     const left = surfaceProfile(sim, { x0: -12, x1: -2, columnWidth: 1 })
     const right = surfaceProfile(sim, { x0: 2, x1: 12, columnWidth: 1 })
