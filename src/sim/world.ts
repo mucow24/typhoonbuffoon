@@ -88,10 +88,19 @@ export class SimWorld {
   waterDrag = 2.2
   /** Fraction of a contact penetration resolved per substep. */
   contactRelaxation = 0.35
+  /** Per-contact damping of a hull moving into fluid, 0..1. */
+  objectContactDrag = 0.05
   /** How much of the inbound normal velocity a contact removes, 0..1. */
   contactNormalDamping = 0.6
-  /** Hard cap on one substep's contact push, metres. */
-  maxContactCorrection = 0.05
+  /**
+   * Hard cap on one substep's contact push, metres.
+   *
+   * Stated in metres but the constraint that matters is velocity: a push is
+   * differentiated by the substep, so 0.05 m over 1.4 ms implies 36 m/s and
+   * 0.02 m implies 14. The larger value was letting a floating box work the
+   * water around it up to 19 m/s.
+   */
+  maxContactCorrection = 0.02
   /** Hard cap on one substep's terrain push, metres. */
   maxTerrainPush = 0.35
   private contactDX = new Float32Array(4096)
@@ -100,20 +109,6 @@ export class SimWorld {
   private contactStamp = new Int32Array(4096)
   private stampCounter = 0
   private readonly tmpVel = { x: 0, y: 0 }
-  /**
-   * Derive FLUID velocity across the whole frame instead of per substep.
-   *
-   * PBF derives velocity as (x - x_prev)/dt over one timestep. Substepping it
-   * and dividing by h instead amplifies ordinary SPH density noise by the
-   * substep count: a correction of 1% of particle spacing is 0.23 m/s over a
-   * frame and 2.8 m/s over a 1.4 ms substep. That is the perpetual churn - the
-   * pool is not unstable, it is being handed twelve times the velocity the
-   * algorithm intends.
-   */
-  fluidVelocityPerFrame = true
-  private frameX = new Float32Array(4096)
-  private frameY = new Float32Array(4096)
-
   step(dt: number): void {
     const h = dt / this.substeps
     this.water.build(
@@ -122,7 +117,6 @@ export class SimWorld {
       this.boundsX1,
       this.fluid.spacing * this.fluid.spacing,
     )
-    this.captureFrameStart()
     this.applyBuoyancy()
     this.wind.advance(dt)
     this.applyWind()
@@ -158,46 +152,9 @@ export class SimWorld {
       this.bend.dampVelocities(this.particles, h)
       this.distance.dampVelocities(this.particles, h)
     }
-    this.deriveFluidVelocity(dt)
     this.fluid.applyViscosity(this.particles)
     this.clearAccelerations()
     this.updateDamage(dt)
-  }
-
-  private captureFrameStart(): void {
-    if (!this.fluidVelocityPerFrame) return
-    const p = this.particles
-    const n = p.highWater
-    if (this.frameX.length < n) {
-      this.frameX = new Float32Array(Math.max(n, 4096))
-      this.frameY = new Float32Array(Math.max(n, 4096))
-    }
-    for (let i = 0; i < n; i++) {
-      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_FLUID) continue
-      this.frameX[i] = p.posX[i]!
-      this.frameY[i] = p.posY[i]!
-    }
-  }
-
-  private deriveFluidVelocity(dt: number): void {
-    if (!this.fluidVelocityPerFrame) return
-    const p = this.particles
-    const n = p.highWater
-    const invDt = 1 / dt
-    const maxSpeed2 = this.maxSpeed * this.maxSpeed
-    for (let i = 0; i < n; i++) {
-      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_FLUID || p.invMass[i] === 0) continue
-      let vx = (p.posX[i]! - this.frameX[i]!) * invDt
-      let vy = (p.posY[i]! - this.frameY[i]!) * invDt
-      const sp2 = vx * vx + vy * vy
-      if (sp2 > maxSpeed2) {
-        const k = this.maxSpeed / Math.sqrt(sp2)
-        vx *= k
-        vy *= k
-      }
-      p.velX[i] = vx
-      p.velY[i] = vy
-    }
   }
 
   private predict(h: number): void {
@@ -279,11 +236,8 @@ export class SimWorld {
       // Field edges are contacts too, and need the same prev carry as terrain.
       // Snapping posX back inside without it makes every wall touch a velocity
       // spike - which is why water admitted AT the edges detonated on arrival.
-      if (p.posX[i]! < this.boundsX0 + r) {
-        p.posX[i] = this.boundsX0 + r
-        p.prevX[i] = p.posX[i]!
-      } else if (p.posX[i]! > this.boundsX1 - r) {
-        p.posX[i] = this.boundsX1 - r
+      if (p.posX[i]! < this.boundsX0 + r || p.posX[i]! > this.boundsX1 - r) {
+        p.posX[i] = p.posX[i]! < this.boundsX0 + r ? this.boundsX0 + r : this.boundsX1 - r
         p.prevX[i] = p.posX[i]!
       }
 
@@ -502,7 +456,8 @@ export class SimWorld {
           for (let q = starts[b]!; q < end; q++) {
             const j = entries[q]!
             if (p.slots.alive[j] !== 1) continue
-            if (p.invMass[j]! <= 0) continue
+            const wj = p.invMass[j]!
+            if (wj <= 0) continue
 
             let nx = p.posX[j]! - xi
             let ny = p.posY[j]! - yi
@@ -518,13 +473,38 @@ export class SimWorld {
               ny /= dist
             }
 
-            // One-way, and relaxed, for the same reasons as the member pass.
-            // Gathered, not applied here. See resolveContacts.
+            // TWO-WAY, mass weighted. One-way displacement is an energy source
+            // with no reaction: shoving fluid aside changes the density field,
+            // the pressure solver answers, and that becomes velocity the object
+            // never paid for. Water around a floating house then never settled -
+            // it plateaued near 5 m/s however hard anything was damped.
+            //
+            // The object's share is small because it is far heavier per
+            // particle, so this is a reaction, not a second buoyancy.
             const pen = Math.min(minDist - dist, this.maxContactCorrection)
             const push = pen * this.contactRelaxation
             this.contactDX[j]! += nx * push
             this.contactDY[j]! += ny * push
             this.contactHits[j]!++
+
+            // The object's half of the interaction is DISSIPATIVE ONLY: damp
+            // the hull's motion into the fluid, never push it back.
+            //
+            // A positional reaction is the physically complete answer and it
+            // does settle the water, but it also lifts - and the analytic
+            // buoyancy is already providing lift, so boxes float far too high
+            // and steel refuses to sink. Draining the energy instead removes
+            // the free work that shoving fluid aside was doing, which is the
+            // part that kept the water alive, without adding a second buoyancy.
+            if (p.invMass[i]! > 0) {
+              const rix = p.posX[i]! - p.prevX[i]!
+              const riy = p.posY[i]! - p.prevY[i]!
+              const vin = rix * nx + riy * ny
+              if (vin > 0) {
+                p.prevX[i]! += nx * vin * this.objectContactDrag
+                p.prevY[i]! += ny * vin * this.objectContactDrag
+              }
+            }
           }
         }
       }

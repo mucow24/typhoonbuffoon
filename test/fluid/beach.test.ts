@@ -37,6 +37,96 @@ function beachWorld(spacing = 0.35, widthM = 120) {
 }
 
 describe('water on the generated beach', () => {
+  /**
+   * KNOWN UNMET. Marked `fails` so it stays visible and flips red the moment
+   * someone fixes it, rather than being quietly relaxed to green.
+   *
+   * Water around a floating object settles to about 2.7 m/s instead of the 1.2
+   * the empty scene reaches. The cause is understood: fluid-to-object coupling
+   * is one-way, so displacing water is free work the hull never pays for, and
+   * the pressure solver turns that displacement into velocity. The complete
+   * answer is a positional reaction, which does settle the water - but it also
+   * lifts, and the analytic buoyancy already supplies lift, so boxes float far
+   * too high and steel will not sink. Fixing it properly means buoyancy
+   * emerging from contact pressure (boundary particles) rather than from the
+   * height field, which is a rewrite of the coupling, not a tuning pass.
+   */
+  it.fails('settles with a structure standing in it, as the seeded level has', () => {
+    // The app always has the house and its anchors present. Every other test in
+    // this file pours water into an empty world, and the empty world settles
+    // while the app plateaus around 3 m/s - so the object was the difference,
+    // not the resolution or the volume. This is the configuration a player is
+    // actually looking at.
+    const { sim, field } = beachWorld(0.35)
+    const t = field.terrain
+    const ground = t.heightAt(-8)
+    sim.addObject({ cx: -8, cy: ground + 9, width: 8, height: 4.5, density: 150 })
+    sim.spawnBlock(-8, ground + 18, 14, 10)
+
+    const trace = run(sim, {
+      seconds: 60,
+      box: { x0: field.left - 5, x1: field.right + 5, y0: -60, y1: 140 },
+    })
+
+    expectFinite(trace)
+    expectNoEscapes(trace, 'water around a structure')
+    expectSettles(trace, { below: 1.2, maxBelow: 8, byFraction: 0.75, label: 'water around a structure' })
+  })
+
+  it('does not get WORSE around a structure than it is today', () => {
+    // Ratchet on the known-unmet case above: 2.7 m/s is not good, but it was
+    // 5.2 before the dissipative hull reaction and it must not slip back.
+    const { sim, field } = beachWorld(0.35)
+    const t = field.terrain
+    const ground = t.heightAt(-8)
+    sim.addObject({ cx: -8, cy: ground + 9, width: 8, height: 4.5, density: 150 })
+    sim.spawnBlock(-8, ground + 18, 14, 10)
+    const trace = run(sim, {
+      seconds: 45,
+      box: { x0: field.left - 5, x1: field.right + 5, y0: -60, y1: 140 },
+    })
+    expectFinite(trace)
+    expectNoEscapes(trace, 'water around a structure')
+    expectSettles(trace, { below: 3.5, maxBelow: 12, byFraction: 0.75, label: 'water around a structure' })
+  })
+
+  it('settles after a large dump from height, as the sandbox tool does', () => {
+    // Matches what the dump-water tool produces in the app: a bigger volume
+    // released from higher up than the other cases here. Measured in the app,
+    // this plateaus around 3 m/s and stops decaying, where the smaller pours
+    // reach 0.5. Sized to the real thing so the suite sees it.
+    const { sim, field } = beachWorld(0.35)
+    const t = field.terrain
+    sim.spawnBlock(-8, t.heightAt(-8) + 18, 14, 10)
+
+    const trace = run(sim, {
+      seconds: 60,
+      box: { x0: field.left - 5, x1: field.right + 5, y0: -60, y1: 140 },
+    })
+
+    expectFinite(trace)
+    expectNoEscapes(trace, 'dumped beach water')
+    expectSettles(trace, { below: 1.2, maxBelow: 8, byFraction: 0.75, label: 'dumped beach water' })
+  })
+
+  it('settles at the resolution the game actually ships with', () => {
+    // The default in the app is 0.25 m. Every other test here uses 0.4-0.45,
+    // which is coarser than anything a player will run, and coarser water is
+    // calmer - so the suite was passing at a setting the product never uses.
+    const { sim, field } = beachWorld(0.25)
+    const t = field.terrain
+    sim.spawnBlock(-8, t.heightAt(-8) + 14, 12, 8)
+
+    const trace = run(sim, {
+      seconds: 60,
+      box: { x0: field.left - 5, x1: field.right + 5, y0: -60, y1: 120 },
+    })
+
+    expectFinite(trace)
+    expectNoEscapes(trace, 'beach water at game resolution')
+    expectSettles(trace, { below: 1.2, maxBelow: 8, byFraction: 0.75, label: 'beach water at 0.25 m' })
+  })
+
   it('settles after being poured onto the shore', () => {
     const { sim, field } = beachWorld()
     const t = field.terrain
