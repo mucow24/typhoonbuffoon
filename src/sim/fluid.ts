@@ -1,4 +1,4 @@
-import { KIND_FLUID, KIND_OBJECT, type ParticleStore } from './particles'
+import { KIND_BOUNDARY, KIND_FLUID, KIND_OBJECT, type ParticleStore } from './particles'
 import { SpatialHash } from './spatialHash'
 
 const MAX_NEIGHBOURS = 48
@@ -159,7 +159,7 @@ export class FluidSolver {
     // Solids are in the neighbour search now: an object that displaces water has
     // to be visible to the density estimate, or pressure cannot act on it and
     // buoyancy has to be bolted on from outside.
-    this.hash.build(p, (1 << KIND_FLUID) | (1 << KIND_OBJECT))
+    this.hash.build(p, (1 << KIND_FLUID) | (1 << KIND_OBJECT) | (1 << KIND_BOUNDARY))
 
     // Neighbour lists, built once per frame and reused across projections.
     const posX = p.posX
@@ -255,7 +255,7 @@ export class FluidSolver {
           // A solid neighbour stands in for the water it displaces: its
           // contribution is rho0 times the area it occupies (Akinci et al.),
           // not the fluid particle mass.
-          const mj = kind[j] === KIND_OBJECT ? this.waterDensity * volume[j]! : mass
+          const mj = kind[j] === KIND_FLUID ? mass : this.waterDensity * volume[j]!
           rho += poly6Coeff * d * d * d * mj
 
           const r = Math.sqrt(r2)
@@ -301,7 +301,7 @@ export class FluidSolver {
           const r = Math.sqrt(r2)
           if (r <= 1e-9) continue
 
-          const solid = kind[j] === KIND_OBJECT
+          const solid = kind[j] !== KIND_FLUID
           // A solid carries no lambda of its own; the fluid's pressure acts on
           // it and it answers with the reaction below.
           const lj = solid ? 0 : lambda[slot[j]!]!
@@ -315,8 +315,8 @@ export class FluidSolver {
             corr = -stK * r2p * r2p
           }
 
-          const mj = solid ? this.waterDensity * volume[j]! : mass
-          const w = spikyCoeff2 * (h - r) * (h - r) * mj
+          const mjc = solid ? this.waterDensity * volume[j]! : mass
+          const w = spikyCoeff2 * (h - r) * (h - r) * mjc
           const sc = (((li + lj + corr) * w) / r) * invRho0
           dx0 += sc * dx
           dy0 += sc * dy

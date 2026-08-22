@@ -3,6 +3,8 @@ import { SlotAllocator } from './slots'
 export const KIND_NODE = 0
 export const KIND_FLUID = 1
 export const KIND_OBJECT = 2
+/** Static solid sampling of the terrain, so the ground has pressure. */
+export const KIND_BOUNDARY = 3
 
 export interface ParticleSpec {
   x: number

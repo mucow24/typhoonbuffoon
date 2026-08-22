@@ -108,6 +108,24 @@ export function fillWater(sim: SimWorld, opts: FillOptions): number {
     return seed / 4294967296 - 0.5
   }
 
+  // Solid particles already in the world, so water is never created inside one.
+  // A solid and a fluid occupying the same point is not a state the game can
+  // reach, and letting a test build it measures the recovery from an impossible
+  // configuration rather than the thing under test.
+  const solids: number[] = []
+  for (let i = 0; i < p.highWater; i++) {
+    if (p.slots.alive[i] === 1 && p.kind[i] !== KIND_FLUID) solids.push(i)
+  }
+  const blocked = (x: number, y: number): boolean => {
+    for (const i of solids) {
+      const clearance = p.radius[i]! + spacing * 0.5
+      const dx = p.posX[i]! - x
+      const dy = p.posY[i]! - y
+      if (dx * dx + dy * dy < clearance * clearance) return true
+    }
+    return false
+  }
+
   let n = 0
   for (let x = opts.x0 + spacing * 0.5; x < opts.x1; x += spacing) {
     const ground = t ? t.heightAt(x) : opts.yBottom
@@ -117,6 +135,7 @@ export function fillWater(sim: SimWorld, opts: FillOptions): number {
     }
     const bottom = Math.max(opts.yBottom ?? floor + spacing * 0.5, floor + spacing * 0.5)
     for (let y = bottom; y < opts.yTop; y += spacing) {
+      if (blocked(x, y)) continue
       p.create({
         x: x + rand() * spacing * jitter,
         y: y + rand() * spacing * jitter,

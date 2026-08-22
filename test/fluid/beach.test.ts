@@ -197,3 +197,59 @@ describe('water on the generated beach', () => {
     expect(speedPercentile(sim, 0.99)).toBeLessThan(1.5)
   })
 })
+
+describe('water at rest is at rest', () => {
+  /**
+   * The bar: settled water has no current in it, and a structure standing in it
+   * is not a propulsion device. Net velocity is the sharp test - a body of water
+   * can have small local jitter and still be going nowhere, but a persistent
+   * drift means momentum is being manufactured.
+   */
+  const netVelocity = (sim: SimWorld) => {
+    const p = sim.particles
+    let mx = 0
+    let my = 0
+    let mass = 0
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== 1) continue
+      const m = 1 / p.invMass[i]!
+      mx += m * p.velX[i]!
+      my += m * p.velY[i]!
+      mass += m
+    }
+    return mass > 0 ? Math.hypot(mx, my) / mass : 0
+  }
+
+  const meanSpeedOf = (sim: SimWorld) => {
+    const p = sim.particles
+    let sum = 0
+    let n = 0
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== 1) continue
+      sum += Math.hypot(p.velX[i]!, p.velY[i]!)
+      n++
+    }
+    return n > 0 ? sum / n : 0
+  }
+
+  it('has no current once settled, with nothing in it', () => {
+    const { sim, field } = beachWorld(0.4)
+    sim.spawnBlock(-8, field.terrain.heightAt(-8) + 14, 12, 8)
+    settle(sim, 120)
+    expect(meanSpeedOf(sim)).toBeLessThan(0.05)
+    expect(netVelocity(sim)).toBeLessThan(0.02)
+  })
+
+  it('has no current once settled, with a structure standing in it', () => {
+    const { sim, field } = beachWorld(0.4)
+    const ground = field.terrain.heightAt(-8)
+    sim.addObject({ cx: -8, cy: ground + 9, width: 8, height: 4.5, density: 150 })
+    sim.spawnBlock(-8, ground + 18, 14, 10)
+    settle(sim, 120)
+    // A structure must not act as a pump. This is the assertion that would have
+    // caught the terrain contributing nothing to the density estimate, which
+    // left the bed unsupported and the whole body creeping downhill.
+    expect(meanSpeedOf(sim)).toBeLessThan(0.05)
+    expect(netVelocity(sim)).toBeLessThan(0.02)
+  })
+})

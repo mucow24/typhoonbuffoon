@@ -6,7 +6,7 @@ import { FluidSolver } from './fluid'
 import { WaterField } from './water'
 import { AIR_DENSITY, WindField } from './wind'
 import { materialAt } from './materials'
-import { KIND_FLUID, KIND_OBJECT, ParticleStore } from './particles'
+import { KIND_BOUNDARY, KIND_FLUID, KIND_OBJECT, ParticleStore } from './particles'
 import { Rng } from '../core/rng'
 
 export interface BreakEvent {
@@ -107,7 +107,60 @@ export class SimWorld {
   private contactStamp = new Int32Array(4096)
   private stampCounter = 0
   private readonly tmpVel = { x: 0, y: 0 }
+  /**
+   * Sample the terrain as static solid particles so the ground exerts pressure.
+   *
+   * Without this the fluid has no neighbours below it near the bed: density
+   * reads low, lambda is zero, and the bottom layer gets no pressure support.
+   * On a flat floor that is survivable, but on a slope the unopposed component
+   * of gravity makes the bottom layer creep downhill forever - a measured net
+   * drift of +0.087 m/s that decayed only as the pile slowly rearranged. It is
+   * the same omission that stopped objects floating, one layer down.
+   *
+   * Two rows deep, because a single row leaves the kernel half empty and only
+   * half-fixes the deficit.
+   */
+  rebuildTerrainBoundary(): void {
+    const p = this.particles
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] === 1 && p.kind[i] === KIND_BOUNDARY) p.destroy(i)
+    }
+    const t = this.terrain
+    if (!t) return
+
+    const spacing = this.fluid.spacing
+    const area = spacing * spacing
+    for (let x = this.boundsX0; x <= this.boundsX1; x += spacing) {
+      const surface = t.heightAt(x)
+      for (let row = 0; row < 2; row++) {
+        p.create({
+          x,
+          y: surface - spacing * (0.5 + row),
+          invMass: 0,
+          radius: spacing * 0.5,
+          kind: KIND_BOUNDARY,
+          volume: area,
+        })
+      }
+    }
+  }
+
+  /** Rebuilt automatically when the terrain, bounds or resolution change. */
+  private boundarySignature = ''
+
+  private ensureTerrainBoundary(): void {
+    const t = this.terrain
+    const sig = t
+      ? `${t.x0}:${t.x1}:${t.heights.length}:${t.heights[0]}:${t.heights[t.heights.length - 1]}:` +
+        `${this.fluid.spacing}:${this.boundsX0}:${this.boundsX1}`
+      : ''
+    if (sig === this.boundarySignature) return
+    this.boundarySignature = sig
+    this.rebuildTerrainBoundary()
+  }
+
   step(dt: number): void {
+    this.ensureTerrainBoundary()
     const h = dt / this.substeps
     this.water.build(
       this.particles,
@@ -726,6 +779,7 @@ export class SimWorld {
   }
 
   clear(): void {
+    this.boundarySignature = ''
     this.particles.clear()
     this.distance.clear()
     this.bend.clear()
