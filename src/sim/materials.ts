@@ -33,6 +33,15 @@ export interface Material {
   yieldStrain: number
   /** How fast rest length migrates once yielding. 0 disables. */
   plasticRate: number
+  /**
+   * Bend angle per joint, radians, at which the member snaps in BENDING.
+   * Without this a member can only fail by elongation, and a mast hit
+   * broadside by wind or wave rotates without stretching - it could bend
+   * double and never break.
+   */
+  breakAngle: number
+  /** Bend angle past which the joint takes a permanent set. Infinity = never. */
+  yieldAngle: number
   zetaAxial: number
   zetaBend: number
   /** Fraction of breakStrain above which damage starts accumulating. */
@@ -56,14 +65,23 @@ export const MATERIALS: Record<MaterialId, Material> = {
     section: 0.3,
     costPerMetre: 10,
     flexuralRigidity: 6.75e6,
-    axialStrengthN: 60e3,
-    breakStrain: 0.04, // stretches visibly, then snaps with no warning
+    // 420 kN is ~4.7 MPa over the 0.09 m^2 section - still far below real
+    // timber's ~40 MPa, but the old 60 kN meant one strut could barely carry
+    // one light house and read as tissue paper. EA = strength/breakStrain
+    // rises with it, so members stop drooping like rope under modest loads.
+    axialStrengthN: 420e3,
+    breakStrain: 0.03, // stretches visibly near failure, then snaps with no warning
     yieldStrain: Infinity, // near-linear-elastic to fracture; never takes a set
     plasticRate: 0,
+    breakAngle: 0.28, // bows legibly, then snaps
+    yieldAngle: Infinity,
     zetaAxial: 0.9,
     zetaBend: 0.9,
-    damageOnset: 0.6,
-    damageRate: 0.35,
+    // Damage starts later and accumulates slower: a structure at 50% load is
+    // holding, not dissolving. The old onset 0.6 / rate 0.35 meant anything
+    // working near half its strength rotted away in seconds.
+    damageOnset: 0.7,
+    damageRate: 0.12,
     // Dark brown. The old tan was within a few percent of the sand palette,
     // so wooden members vanished into the beach behind them.
     colour: 0x7a4a26,
@@ -77,14 +95,16 @@ export const MATERIALS: Record<MaterialId, Material> = {
     section: 0.14,
     costPerMetre: 34,
     flexuralRigidity: 1.2e7,
-    axialStrengthN: 400e3,
+    axialStrengthN: 1.5e6,
     breakStrain: 0.015,
     yieldStrain: 0.008, // yields, then stays bent - it warns you before it goes
     plasticRate: 0.6,
+    breakAngle: 0.6,
+    yieldAngle: 0.12, // takes a visible permanent set long before it fails
     zetaAxial: 0.95,
     zetaBend: 0.95,
-    damageOnset: 0.5,
-    damageRate: 0.25,
+    damageOnset: 0.65,
+    damageRate: 0.1,
     colour: 0x9aa7b4,
     dragCoefficient: 1.1,
     segmentsPerMetre: 0.35,

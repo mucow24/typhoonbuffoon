@@ -6,7 +6,7 @@ import { FluidSolver } from './fluid'
 import { WaterField } from './water'
 import { AIR_DENSITY, WindField } from './wind'
 import { materialAt } from './materials'
-import { KIND_BOUNDARY, KIND_FLUID, KIND_OBJECT, ParticleStore } from './particles'
+import { KIND_BOUNDARY, KIND_FLUID, KIND_NODE, KIND_OBJECT, ParticleStore } from './particles'
 import { Rng } from '../core/rng'
 
 export interface BreakEvent {
@@ -44,8 +44,31 @@ export class SimWorld {
 
   gravity = -9.81
   substeps = 12
-  /** Tangential velocity retained per contact frame. 1 is frictionless. */
+  /**
+   * Tangential velocity retained per contact FRAME for solids. 1 is
+   * frictionless. Applied per substep as friction^(1/substeps), so the frame
+   * semantics hold whatever the substep count - the old code applied the raw
+   * factor every substep, which compounds to 0.65^12 ~ 0.6% retention and
+   * glued anything touching the ground to it.
+   */
   groundFriction = 0.65
+  /**
+   * Same, for FLUID. Water slides over a sandy bed; its dissipation should
+   * come from viscosity, not a no-slip clamp. Mild, or dam-break fronts crawl.
+   */
+  fluidBedFriction = 0.9
+  /**
+   * Mass-proportional damping for FLUID, per second. PBF's projection is not
+   * energy-conserving - violent scenes pump a little energy each bounce, and
+   * the literature's answer is viscosity. Most of ours comes from XSPH; this
+   * is a last-resort bulk term and should stay well below the structural
+   * damping or waves die crossing the field. Zero disables.
+   *
+   * 0.02/s costs a wave ~18% over a 10-second crossing and takes the settled
+   * pool's residual jiggle from 0.059 to 0.040 m/s - measured on the beach
+   * rest probe; the settle tests depend on it.
+   */
+  fluidDamping = 0.02
   /**
    * Normal velocity retained on ground contact. Near zero on purpose.
    *
@@ -57,6 +80,7 @@ export class SimWorld {
   groundRestitution = 0.02
   /**
    * Mass-proportional (Rayleigh alpha) damping, as a rate per second.
+   * STRUCTURE NODES ONLY - see updateVelocities.
    *
    * The constraint dampers are stiffness-proportional and so target local,
    * high-frequency modes; they barely touch a whole structure swinging bodily
@@ -64,8 +88,10 @@ export class SimWorld {
    * than the local estimate. Without a little of this, an unloaded structure
    * wobbles forever instead of settling.
    *
-   * Keep it small. It is the term that would flatten the slow lean if it grew,
-   * and the lean is the point.
+   * Keep it small, and keep it OFF the fluid: applied to water it bled ~30% of
+   * every wave and current per second, which is most of why the flood felt
+   * like syrup. The plan's own prescription is alpha ~ 0; this is the one
+   * structural exception.
    */
   linearDamping = 0.35
   terrain: Terrain | null = null
@@ -84,8 +110,6 @@ export class SimWorld {
   maxSpeed = 45
   /** Water density for buoyancy, kg/m^3. */
   waterDensity = 1000
-  /** Linear drag from submersion, per second. Stops floaters bobbing forever. */
-  waterDrag = 2.2
   /** Fraction of a contact penetration resolved per substep. */
   contactRelaxation = 0.35
   /** How much of the inbound normal velocity a contact removes, 0..1. */
@@ -106,7 +130,24 @@ export class SimWorld {
   private contactHits = new Int32Array(4096)
   private contactStamp = new Int32Array(4096)
   private stampCounter = 0
+  /**
+   * Reactions owed to member ENDPOINTS from capsule contacts, kept apart from
+   * contactDX because they are applied with different semantics: position
+   * only, no prev carry, so sustained water pressure becomes velocity and then
+   * force through the constraint solve - which is what loads a flood wall.
+   */
+  private memberDX = new Float32Array(4096)
+  private memberDY = new Float32Array(4096)
+  private memberHits = new Int32Array(4096)
   private readonly tmpVel = { x: 0, y: 0 }
+  /**
+   * Constraint indices destroyed by breakage since the last drain. The session
+   * MUST drain these and drop them from its member records - a freed index is
+   * recycled by the next build action, and destroying it a second time through
+   * a stale record kills whatever innocent constraint lives there now.
+   */
+  readonly destroyedDistance: number[] = []
+  readonly destroyedBends: number[] = []
   /**
    * Sample the terrain as static solid particles so the ground exerts pressure.
    *
@@ -169,6 +210,8 @@ export class SimWorld {
       this.fluid.spacing * this.fluid.spacing,
     )
     this.applyBuoyancy()
+    this.applyHydrostaticLoad()
+    this.applyWaterDrag(dt)
     this.wind.advance(dt)
     this.applyWind()
     this.fluid.beginFrame(this.particles)
@@ -195,14 +238,18 @@ export class SimWorld {
       // work when every step is corrected.
       this.fluid.project(this.particles, h)
       this.beginContacts()
-      this.solveFluidAgainstMembers()
+      this.solveSolidContacts()
+      this.solveMemberContacts()
       this.resolveContacts()
+      this.resolveMemberReactions()
       this.solveContacts()
       this.updateVelocities(h)
       this.bend.dampVelocities(this.particles, h)
       this.distance.dampVelocities(this.particles, h)
+      this.fluid.applyHullViscosity(this.particles)
+      if (this.fluid.viscosityEverySubstep) this.fluid.applyViscosity(this.particles)
     }
-    this.fluid.applyViscosity(this.particles)
+    if (!this.fluid.viscosityEverySubstep) this.fluid.applyViscosity(this.particles)
     this.clearAccelerations()
     this.updateDamage(dt)
   }
@@ -230,12 +277,19 @@ export class SimWorld {
   private updateVelocities(h: number): void {
     const p = this.particles
     const alive = p.slots.alive
+    const kind = p.kind
     const n = p.highWater
     const invH = 1 / h
+    // Structure-only: water is not a damped oscillator to be settled, and
+    // 0.35/s applied globally cost the fluid ~30% of its momentum per second.
     const keep = this.linearDamping > 0 ? Math.exp(-this.linearDamping * h) : 1
+    const keepFluid = this.fluidDamping > 0 ? Math.exp(-this.fluidDamping * h) : 1
     const maxSpeed = this.maxSpeed
     const maxSpeed2 = maxSpeed * maxSpeed
-    const friction = this.groundFriction
+    // Per-FRAME friction semantics, distributed over the substeps.
+    const invSub = 1 / this.substeps
+    const frictionSolid = Math.pow(this.groundFriction, invSub)
+    const frictionFluid = Math.pow(this.fluidBedFriction, invSub)
     const restitution = this.groundRestitution
     const grounded = this.grounded
 
@@ -251,10 +305,16 @@ export class SimWorld {
         vy *= k
       }
 
-      vx *= keep
-      vy *= keep
+      if (kind[i] === KIND_NODE) {
+        vx *= keep
+        vy *= keep
+      } else if (kind[i] === KIND_FLUID && keepFluid < 1) {
+        vx *= keepFluid
+        vy *= keepFluid
+      }
 
       if (grounded[i] === 1) {
+        const friction = kind[i] === KIND_FLUID ? frictionFluid : frictionSolid
         vx *= friction
         if (vy > 0) vy *= restitution
       }
@@ -341,11 +401,20 @@ export class SimWorld {
   private grounded = new Uint8Array(4096)
 
   /**
-   * Buoyancy and water drag, from REST volume. Computed once per frame into the
-   * acceleration accumulators.
+   * Buoyancy from REST volume, for nodes AND object particles, once per frame
+   * into the acceleration accumulators.
    *
    * Net acceleration is g * (rhoWater/rhoBody - 1), so wood at 500 kg/m^3 rises
    * and steel at 7850 sinks with no flag anywhere - density alone decides it.
+   *
+   * Objects briefly had buoyancy from the pressure field alone (they are in
+   * the density estimate, so the water pushes on them directly). Measured:
+   * that lift exists only near the FREE SURFACE - PBF's per-substep lambda
+   * carries no depth gradient in the bulk, so a wood crate released 5 m down
+   * hovered there forever at any interface stiffness. The analytic term works
+   * at any depth and is resolution-independent; the pressure interaction
+   * stays for what it is actually good at - displacing water around the hull
+   * and transmitting waves and slams.
    */
   private applyBuoyancy(): void {
     const p = this.particles
@@ -354,40 +423,180 @@ export class SimWorld {
     for (let i = 0; i < p.highWater; i++) {
       if (alive[i] !== 1 || p.invMass[i] === 0) continue
       if (p.kind[i] === KIND_FLUID) continue
-      // Objects get their buoyancy from the pressure field now - they take part
-      // in the density estimate, so the water lifts them directly. Applying the
-      // analytic term as well would count it twice.
-      if (p.kind[i] === KIND_OBJECT) continue
       const vol = p.volume[i]!
       if (vol <= 0) continue
 
-      const frac = this.water.submergedFraction(p.posX[i]!, p.posY[i]!, p.radius[i]!)
+      let frac = this.water.submergedFraction(p.posX[i]!, p.posY[i]!, p.radius[i]!)
       if (frac <= 0) continue
+
+      // Object particles scale by measured wetness (last frame's neighbour
+      // census). The column field says "below the local waterline"; only
+      // actual fluid contact says "in water" - a house standing on a wet
+      // slope is beside the puddle, not in it, and lifting it on the column
+      // reading flickered it into orbit.
+      if (p.kind[i] === KIND_OBJECT) {
+        const wet = this.fluid.solidWetCount[i] ?? 0
+        frac *= Math.min(1, wet / 8)
+        if (frac <= 0) continue
+      }
 
       const mass = 1 / p.invMass[i]!
       p.accY[i]! += g * ((this.waterDensity * vol) / mass) * frac
-
-      // Drag against the LOCAL WATER velocity, not absolute velocity, so a
-      // current or a passing wave actually pushes a body along instead of only
-      // slowing it down.
-      this.water.velocityAt(p.posX[i]!, this.tmpVel)
-      const drag = this.waterDrag * frac
-      p.accX[i]! -= (p.velX[i]! - this.tmpVel.x) * drag
-      p.accY[i]! -= (p.velY[i]! - this.tmpVel.y) * drag
     }
   }
 
   /**
-   * Fluid against structural members. Members are line segments, so they are
-   * treated as capsules and fluid particles are pushed out with a mass-weighted
-   * reaction onto the member's endpoints - which is what lets a flood wall
-   * actually hold water back instead of being decorative.
+   * Static water pressure on members, from the column height field.
+   *
+   * Positional capsule contacts transmit the *dynamic* exchange - impacts,
+   * currents shoving - but at rest the water stands off the capsule and the
+   * per-substep penetration flux is tiny, so contacts alone deliver a few
+   * percent of the true hydrostatic load. The static load is computed the way
+   * the rest of the member regime computes water effects: from the height
+   * field, resolution-independent by construction.
+   *
+   * Per member: sample the water surface a little to each side, take the
+   * pressure difference at the member's depth, and load its VERTICAL extent
+   * with the net horizontal force. Only the horizontal component is applied -
+   * the vertical pressure difference across a member IS buoyancy, which
+   * applyBuoyancy already provides from rest volume. Integrated over a wall
+   * this reproduces the 1/2 rho g H^2 resultant, which is the load the whole
+   * flood-wall archetype is about.
+   *
+   * Known limit: a sealed vessel (water inside a dome vs outside) shares one
+   * column, so interior/exterior pressure cannot differ at the same x. The
+   * dome archetype is deferred in the plan for exactly this kind of reason.
+   */
+  private applyHydrostaticLoad(): void {
+    const p = this.particles
+    const d = this.distance
+    const alive = d.slots.alive
+    const g = -this.gravity
+    const rhoG = this.waterDensity * g
+    const sampleOffset = Math.max(1.5 * this.water.resolution, 1.0)
+
+    for (let m = 0; m < d.highWater; m++) {
+      if (alive[m] !== 1) continue
+      const rest = d.rest[m]!
+      if (rest <= 1e-6) continue
+      const ia = d.a[m]!
+      const ib = d.b[m]!
+      const wa = p.invMass[ia]!
+      const wb = p.invMass[ib]!
+      if (wa === 0 && wb === 0) continue
+
+      const vertical = Math.abs(p.posY[ib]! - p.posY[ia]!)
+      if (vertical < 0.05) continue
+
+      const midX = (p.posX[ia]! + p.posX[ib]!) * 0.5
+      const midY = (p.posY[ia]! + p.posY[ib]!) * 0.5
+
+      const surfL = this.water.surfaceAt(midX - sampleOffset)
+      const surfR = this.water.surfaceAt(midX + sampleOffset)
+      const pL = surfL === -Infinity ? 0 : Math.max(0, rhoG * (surfL - midY))
+      const pR = surfR === -Infinity ? 0 : Math.max(0, rhoG * (surfR - midY))
+      const net = pL - pR
+      if (net === 0) continue
+
+      const fx = net * vertical
+      if (wa > 0) p.accX[ia]! += fx * 0.5 * wa
+      if (wb > 0) p.accX[ib]! += fx * 0.5 * wb
+    }
+  }
+
+  /**
+   * Water drag: the plan's F = 1/2 rho Cd A v_rel^2 law, against the LOCAL
+   * water velocity so a current or a passing wave pushes a body along instead
+   * of only slowing it down. Frontal geometry comes from REST shape - the same
+   * rule as buoyancy and wind, and for the same runaway reason.
+   *
+   * Members are loaded like applyWind loads them: per member, projected across
+   * the flow, split to the endpoints. The old implementation was a
+   * mass-proportional relaxation (accel = -2.2/s * v_rel), which made drag
+   * scale with MASS instead of area - physically backwards, and two orders of
+   * magnitude below a real wave load on a wall.
+   */
+  private applyWaterDrag(dt: number): void {
+    const p = this.particles
+    const half = 0.5 * this.waterDensity
+    const d = this.distance
+    const alive = d.slots.alive
+
+    for (let m = 0; m < d.highWater; m++) {
+      if (alive[m] !== 1) continue
+      const rest = d.rest[m]!
+      if (rest <= 1e-6) continue // welds have no frontal area
+      const ia = d.a[m]!
+      const ib = d.b[m]!
+      const wa = p.invMass[ia]!
+      const wb = p.invMass[ib]!
+      if (wa === 0 && wb === 0) continue
+
+      const midX = (p.posX[ia]! + p.posX[ib]!) * 0.5
+      const midY = (p.posY[ia]! + p.posY[ib]!) * 0.5
+      const mat = materialAt(d.material[m]!)
+      const submerged = this.water.submergedFraction(midX, midY, mat.section * 0.5)
+      if (submerged <= 0.01) continue
+
+      this.water.velocityAt(midX, this.tmpVel)
+      const relX = this.tmpVel.x - (p.velX[ia]! + p.velX[ib]!) * 0.5
+      const relY = this.tmpVel.y - (p.velY[ia]! + p.velY[ib]!) * 0.5
+      const relSpeed = Math.sqrt(relX * relX + relY * relY)
+      if (relSpeed < 1e-6) continue
+
+      const ex = p.posX[ib]! - p.posX[ia]!
+      const ey = p.posY[ib]! - p.posY[ia]!
+      const len = Math.sqrt(ex * ex + ey * ey)
+      if (len < 1e-9) continue
+      const dirX = relX / relSpeed
+      const dirY = relY / relSpeed
+      const cross = Math.abs((ex * dirY - ey * dirX) / len)
+      const frontal = rest * cross + mat.section
+
+      let force = half * mat.dragCoefficient * frontal * relSpeed * relSpeed * submerged
+      // Drag may slow the relative motion, never reverse it: explicit
+      // quadratic drag on a light node at high v_rel overshoots the shared
+      // velocity and oscillates. Cap the impulse at what stops the motion.
+      const massAB = (wa > 0 ? 1 / wa : 0) + (wb > 0 ? 1 / wb : 0)
+      const maxForce = (massAB * relSpeed) / dt
+      if (force > maxForce) force = maxForce
+      const fx = force * dirX
+      const fy = force * dirY
+
+      if (wa > 0) {
+        p.accX[ia]! += fx * 0.5 * wa
+        p.accY[ia]! += fy * 0.5 * wa
+      }
+      if (wb > 0) {
+        p.accX[ib]! += fx * 0.5 * wb
+        p.accY[ib]! += fy * 0.5 * wb
+      }
+    }
+
+    // Objects get no force-based drag here. Their drag is the pairwise hull
+    // viscosity in the fluid solver (fluid.applyHullViscosity): quadratic
+    // drag against the column mean misfired in spray, and drag against the
+    // measured local flow read the hull's own entrained wake and vanished.
+  }
+
+  /**
+   * Particles against structural members, TWO-WAY. Members are line segments
+   * treated as capsules; a penetrating particle is pushed out and the member's
+   * endpoints receive the equal-and-opposite share, split by inverse mass with
+   * the standard PBD barycentric weights. This is the channel that loads a
+   * flood wall: settled water leans on the capsule every substep, and the
+   * sustained pushback becomes strain in the wall's constraints. It is also
+   * what lets a crate rest ON a platform and bend it.
+   *
+   * The particle side keeps the inelastic prev-carry semantics of
+   * resolveContacts; the member side is position-only (resolveMemberReactions)
+   * so sustained pressure reads as force rather than being silently cancelled.
    *
    * The capsule radius has a floor of 0.75 * particle spacing. A member thinner
    * than about one particle spacing is not watertight and fluid tunnels through
    * it, which on a flood wall reads as a bug rather than a near miss.
    */
-  private solveFluidAgainstMembers(): void {
+  private solveMemberContacts(): void {
     const d = this.distance
     if (d.count === 0) return
     const p = this.particles
@@ -401,6 +610,8 @@ export class SimWorld {
 
     for (let m = 0; m < d.highWater; m++) {
       if (alive[m] !== 1) continue
+      const rest = d.rest[m]!
+      if (rest <= 1e-6) continue // welds are points, not surfaces
       const ia = d.a[m]!
       const ib = d.b[m]!
       const ax = p.posX[ia]!
@@ -409,6 +620,9 @@ export class SimWorld {
       const by = p.posY[ib]!
       const mat = materialAt(d.material[m]!)
       const radius = Math.max(mat.section * 0.5, spacing * 0.75)
+      const noCollide = d.noCollideCluster[m]!
+      const wa = p.invMass[ia]!
+      const wb = p.invMass[ib]!
 
       const ex = bx - ax
       const ey = by - ay
@@ -435,6 +649,10 @@ export class SimWorld {
             if (this.contactStamp[j] === stamp) continue
             this.contactStamp[j] = stamp
             if (p.slots.alive[j] !== 1 || p.invMass[j] === 0) continue
+            if (j === ia || j === ib) continue
+            // A member bolted to an object must not collide with that object,
+            // or the capsule fights the weld and pumps energy.
+            if (noCollide >= 0 && p.cluster[j] === noCollide) continue
 
             const px = p.posX[j]! - ax
             const py = p.posY[j]! - ay
@@ -456,21 +674,35 @@ export class SimWorld {
               ny /= dist
             }
 
-            // One-way: the fluid particle is pushed out, the member is not
-            // pushed back. All fluid -> body force is mediated by the water
-            // field (buoyancy + drag). Doing both double-counts buoyancy, and
-            // since a wood crate's particles are lighter than fluid particles
-            // the collision term dominated and launched objects tens of metres.
-            //
+            // Split the pushout across the pair by inverse mass, with the
+            // segment's effective inverse mass at the contact point. Gathered,
+            // not applied here - see resolveContacts / resolveMemberReactions.
             // Resolved over several substeps rather than in one jump: a full
-            // penetration of one particle spacing discharged in a single 1.4 ms
-            // substep is a 280 m/s impulse.
-            // Gathered, not applied here. See resolveContacts.
+            // penetration of one particle spacing discharged in a single
+            // 1.4 ms substep is a 280 m/s impulse.
+            const wj = p.invMass[j]!
+            const u1 = 1 - u
+            const wSeg = wa * u1 * u1 + wb * u * u
+            const wSum = wj + wSeg
+            if (wSum <= 0) continue
             const pen = Math.min(minDist - dist, this.maxContactCorrection)
             const push = pen * this.contactRelaxation
-            this.contactDX[j]! += nx * push
-            this.contactDY[j]! += ny * push
+            const scale = push / wSum
+
+            this.contactDX[j]! += nx * scale * wj
+            this.contactDY[j]! += ny * scale * wj
             this.contactHits[j]!++
+
+            if (wa > 0) {
+              this.memberDX[ia]! -= nx * scale * wa * u1
+              this.memberDY[ia]! -= ny * scale * wa * u1
+              this.memberHits[ia]!++
+            }
+            if (wb > 0) {
+              this.memberDX[ib]! -= nx * scale * wb * u
+              this.memberDY[ib]! -= ny * scale * wb * u
+              this.memberHits[ib]!++
+            }
           }
         }
       }
@@ -604,9 +836,120 @@ export class SimWorld {
       this.contactDY = new Float32Array(cap)
       this.contactHits = new Int32Array(cap)
     }
+    if (this.memberDX.length < n) {
+      const cap = Math.max(n, 4096)
+      this.memberDX = new Float32Array(cap)
+      this.memberDY = new Float32Array(cap)
+      this.memberHits = new Int32Array(cap)
+    }
     this.contactDX.fill(0, 0, n)
     this.contactDY.fill(0, 0, n)
     this.contactHits.fill(0, 0, n)
+    this.memberDX.fill(0, 0, n)
+    this.memberDY.fill(0, 0, n)
+    this.memberHits.fill(0, 0, n)
+  }
+
+  /**
+   * Object-object contact: particles of DIFFERENT clusters push apart, split
+   * by inverse mass, through the same gather machinery as everything else.
+   * Without this two crates pass through each other and nothing can ever
+   * stack, dam, or pile up. Shape matching then keeps each cluster rigid
+   * against the dent.
+   */
+  private solveSolidContacts(): void {
+    if (this.clusters.length < 2) return
+    const p = this.particles
+    const hash = this.fluid.hash
+    const cluster = p.cluster
+    const alive = p.slots.alive
+
+    for (const c of this.clusters) {
+      if (!c.alive) continue
+      for (let k = 0; k < c.particles.length; k++) {
+        const i = c.particles[k]!
+        if (alive[i] !== 1) continue
+        const xi = p.posX[i]!
+        const yi = p.posY[i]!
+        const ri = p.radius[i]!
+        const wi = p.invMass[i]!
+        const ci = cluster[i]!
+
+        const buckets = hash.collectBuckets(xi, yi)
+        const starts = hash.starts
+        const entries = hash.entries
+        const scratch = hash.scratch
+        for (let s = 0; s < buckets; s++) {
+          const b = scratch[s]!
+          const end = starts[b + 1]!
+          for (let e = starts[b]!; e < end; e++) {
+            const j = entries[e]!
+            // Each unordered pair once, and only across clusters.
+            if (j <= i) continue
+            if (alive[j] !== 1 || p.kind[j] !== KIND_OBJECT) continue
+            if (cluster[j] === ci) continue
+
+            const dx = xi - p.posX[j]!
+            const dy = yi - p.posY[j]!
+            const minDist = ri + p.radius[j]!
+            const d2 = dx * dx + dy * dy
+            if (d2 >= minDist * minDist || d2 < 1e-12) continue
+            const dist = Math.sqrt(d2)
+            const nx = dx / dist
+            const ny = dy / dist
+
+            const wj = p.invMass[j]!
+            const wSum = wi + wj
+            if (wSum <= 0) continue
+            const pen = Math.min(minDist - dist, this.maxContactCorrection)
+            const scale = (pen * this.contactRelaxation) / wSum
+
+            if (wi > 0) {
+              this.contactDX[i]! += nx * scale * wi
+              this.contactDY[i]! += ny * scale * wi
+              this.contactHits[i]!++
+            }
+            if (wj > 0) {
+              this.contactDX[j]! -= nx * scale * wj
+              this.contactDY[j]! -= ny * scale * wj
+              this.contactHits[j]!++
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Apply the substep's member-endpoint reactions. SUMMED, not averaged:
+   * thirty particles of settled water leaning on a wall are thirty separate
+   * loads, and averaging them would cap the hydrostatic force at one
+   * contact's worth however deep the water gets. The per-substep cap bounds
+   * the transient case (a wave slamming every sample point at once).
+   *
+   * Position only - prev is deliberately NOT carried, so sustained contact
+   * pressure differentiates into velocity, the constraint solve answers it
+   * with strain, and the near-critical zeta damping keeps the exchange from
+   * ringing. That chain is precisely "the water loads the wall".
+   */
+  private resolveMemberReactions(): void {
+    const p = this.particles
+    const n = p.highWater
+    for (let i = 0; i < n; i++) {
+      if (this.memberHits[i] === 0) continue
+      if (p.slots.alive[i] !== 1 || p.invMass[i] === 0) continue
+      let dx = this.memberDX[i]!
+      let dy = this.memberDY[i]!
+      const mag = Math.sqrt(dx * dx + dy * dy)
+      if (mag < 1e-12) continue
+      if (mag > this.maxContactCorrection) {
+        const k = this.maxContactCorrection / mag
+        dx *= k
+        dy *= k
+      }
+      p.posX[i]! += dx
+      p.posY[i]! += dy
+    }
   }
 
   /**
@@ -676,12 +1019,42 @@ export class SimWorld {
 
   /** Add a rectangular physics object. Returns its cluster. */
   addObject(spec: ObjectSpec): Cluster {
+    // An object dropped into existing water must DISPLACE it - materialising
+    // solid particles inside fluid ones is a teleport, and the density error
+    // it creates discharges as spray however the solver is tuned. The flood
+    // driver replaces the volume at its own admission rate.
+    this.clearFluidInRect(
+      spec.cx - spec.width * 0.5,
+      spec.cx + spec.width * 0.5,
+      spec.cy - spec.height * 0.5,
+      spec.cy + spec.height * 0.5,
+    )
     // Sampled at the fluid's own resolution unless told otherwise. Coarser than
     // that and water simply flows between the object's particles: the density
     // estimate never sees a solid, so nothing floats.
-    const c = buildObject(this.particles, { spacing: this.fluid.spacing, ...spec })
+    const c = buildObject(this.particles, {
+      spacing: this.fluid.spacing,
+      clusterIndex: this.clusters.length,
+      ...spec,
+    })
     this.clusters.push(c)
     return c
+  }
+
+  private clearFluidInRect(x0: number, x1: number, y0: number, y1: number): void {
+    const p = this.particles
+    const pad = this.fluid.spacing * 0.5
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_FLUID) continue
+      const x = p.posX[i]!
+      const y = p.posY[i]!
+      if (x > x0 - pad && x < x1 + pad && y > y0 - pad && y < y1 + pad) p.destroy(i)
+    }
+  }
+
+  /** Index of a cluster in this world's list, for contact exclusions. -1 if absent. */
+  clusterIndexOf(cluster: Cluster): number {
+    return this.clusters.indexOf(cluster)
   }
 
   clearObjects(): void {
@@ -741,6 +1114,83 @@ export class SimWorld {
         this.breakConstraint(i, signed)
       }
     }
+
+    // Bending failure. Transverse load - wind on a mast, a wave against a
+    // stilt - rotates segments without elongating them, so a member under the
+    // genre's primary load case accumulates no axial strain at all. Without a
+    // break path on the ANGLE, a beam could fold double and never snap.
+    const b = this.bend
+    const bAlive = b.slots.alive
+    const bn = b.highWater
+    for (let i = 0; i < bn; i++) {
+      if (bAlive[i] !== 1) continue
+      const m = materialAt(b.material[i]!)
+      const signed = b.angle[i]!
+      const a = Math.abs(signed)
+
+      const load = m.breakAngle > 0 && Number.isFinite(m.breakAngle) ? a / m.breakAngle : 0
+      if (load > m.damageOnset && m.damageOnset < 1) {
+        const over = (load - m.damageOnset) / (1 - m.damageOnset)
+        b.damage[i] = Math.min(0.9, b.damage[i]! + m.damageRate * over * over * dt)
+      }
+
+      // Steel takes a permanent set in bending - the rest angle migrates
+      // toward the deformed shape, so it stays bent when the load lifts.
+      if (m.plasticRate > 0 && Number.isFinite(m.yieldAngle) && a > m.yieldAngle) {
+        const excess = signed - Math.sign(signed) * m.yieldAngle
+        b.restAngle[i]! += excess * m.plasticRate * dt
+      }
+
+      if (a > m.breakAngle * (1 - b.damage[i]!)) {
+        this.breakBend(i, signed)
+      }
+    }
+  }
+
+  /**
+   * A joint snapping in bending severs the member there: the bend goes, and so
+   * does the weaker of the two distance segments meeting at the joint -
+   * a fracture is a break in the material, not just a freed hinge.
+   */
+  private breakBend(i: number, angle: number): void {
+    const b = this.bend
+    const ib = b.b[i]!
+    const ia = b.a[i]!
+    const ic = b.c[i]!
+
+    let victim = -1
+    let worst = -1
+    const d = this.distance
+    for (let j = 0; j < d.highWater; j++) {
+      if (d.slots.alive[j] !== 1) continue
+      const x = d.a[j]!
+      const y = d.b[j]!
+      const spansAB = (x === ia && y === ib) || (x === ib && y === ia)
+      const spansBC = (x === ib && y === ic) || (x === ic && y === ib)
+      if (!spansAB && !spansBC) continue
+      const s = Math.abs(d.strain[j]!)
+      if (s > worst) {
+        worst = s
+        victim = j
+      }
+    }
+
+    b.destroy(i)
+    this.destroyedBends.push(i)
+    if (victim >= 0) {
+      this.breakConstraint(victim, Math.sign(angle) * worst)
+    } else {
+      // No adjacent segment found (already broken): still report the event.
+      const p = this.particles
+      this.breakEvents.push({
+        a: ia,
+        b: ic,
+        strain: angle,
+        x: p.posX[ib]!,
+        y: p.posY[ib]!,
+        material: b.material[i]!,
+      })
+    }
   }
 
   private breakConstraint(i: number, strain: number): void {
@@ -759,6 +1209,7 @@ export class SimWorld {
     })
 
     d.destroy(i)
+    this.destroyedDistance.push(i)
     this.severBendsSpanning(ia, ib)
   }
 
@@ -774,8 +1225,22 @@ export class SimWorld {
       if ((x === ia && y === ib) || (y === ia && x === ib) ||
           (y === ia && z === ib) || (z === ia && y === ib)) {
         b.destroy(j)
+        this.destroyedBends.push(j)
       }
     }
+  }
+
+  /**
+   * Constraint indices freed by breakage since the last call. Whoever keeps
+   * external records of constraint indices (the Session's member table) must
+   * call this every frame and drop the listed indices, BEFORE acting on those
+   * records - freed slots are recycled by the very next create.
+   */
+  drainDestroyed(): { distance: number[]; bends: number[] } {
+    const out = { distance: [...this.destroyedDistance], bends: [...this.destroyedBends] }
+    this.destroyedDistance.length = 0
+    this.destroyedBends.length = 0
+    return out
   }
 
   clear(): void {
@@ -785,6 +1250,30 @@ export class SimWorld {
     this.bend.clear()
     this.clusters.length = 0
     this.breakEvents.length = 0
+    this.destroyedDistance.length = 0
+    this.destroyedBends.length = 0
+  }
+
+  /**
+   * Clear the BUILT world - structure nodes, members, objects - while leaving
+   * fluid and the terrain boundary alone. This is what a live-edit rebuild
+   * wants: pressing Ctrl+Z during a flood should revert the build, not
+   * vaporise several thousand water particles and un-flood the level.
+   */
+  clearStructures(): void {
+    const p = this.particles
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1) continue
+      const kind = p.kind[i]
+      if (kind === KIND_FLUID || kind === KIND_BOUNDARY) continue
+      p.destroy(i)
+    }
+    this.distance.clear()
+    this.bend.clear()
+    this.clusters.length = 0
+    this.breakEvents.length = 0
+    this.destroyedDistance.length = 0
+    this.destroyedBends.length = 0
   }
 
   /**
@@ -826,6 +1315,11 @@ export class SimWorld {
         // Spawning below ground would be teleported out by the terrain pass and
         // differentiate into an enormous velocity.
         if (y < ground + spacing) continue
+        // Never spawn into occupied space - same rule as the flood inflow, for
+        // the same reason: an overlapped pair is a density error the solver
+        // can only answer with a violent correction. Dumping water onto water
+        // fills the gaps and skips the rest.
+        if (this.hasFluidNear(x, y, spacing * 0.85)) continue
         p.create({
           x: x + (this.jitter.next() - 0.5) * spacing * 0.25,
           y: y + (this.jitter.next() - 0.5) * spacing * 0.25,
@@ -843,6 +1337,26 @@ export class SimWorld {
     const p = this.particles
     for (let i = 0; i < p.highWater; i++) {
       if (p.slots.alive[i] === 1 && p.kind[i] === KIND_FLUID) p.destroy(i)
+    }
+  }
+
+  /**
+   * Change the fluid resolution, keeping existing water consistent. The PBF
+   * solve hoists ONE particle mass for all fluid, so existing particles must
+   * be restamped to the new mass and radius or the solver mixes two masses
+   * under one assumption - the old slider left them stale. The water's
+   * represented volume reinterprets with the new spacing; the flood driver
+   * tops it up or drains it toward the target level on the next frames.
+   */
+  setFluidSpacing(spacing: number): void {
+    if (!(spacing > 0) || spacing === this.fluid.spacing) return
+    this.fluid.spacing = spacing
+    const p = this.particles
+    const invMass = 1 / this.fluid.particleMass
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_FLUID) continue
+      p.invMass[i] = invMass
+      p.radius[i] = spacing * 0.5
     }
   }
 

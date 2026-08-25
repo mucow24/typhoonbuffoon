@@ -39,11 +39,6 @@ export class Terrain {
     return { nx: -dy / len, ny: (2 * h) / len }
   }
 
-  /** Signed distance above the surface. Negative means buried. */
-  depthBelowSurface(x: number, y: number): number {
-    return this.heightAt(x) - y
-  }
-
   get minHeight(): number {
     let m = Infinity
     for (const h of this.heights) if (h < m) m = h

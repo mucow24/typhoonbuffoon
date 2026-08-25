@@ -11,6 +11,13 @@ export interface DistanceSpec {
   zeta: number
   /** Index into MATERIAL_IDS. */
   material?: number
+  /**
+   * Cluster index this member's capsule must NOT collide with, -1 for none.
+   * A stilt bolted to a house would otherwise fight its own weld: the capsule
+   * pushes the house particles out while the weld pulls them back, and the
+   * loop pumps energy until the house flips.
+   */
+  noCollideCluster?: number
 }
 
 /**
@@ -36,6 +43,8 @@ export class DistanceConstraints {
   material: Uint8Array
   /** Accumulated, irreversible. Lowers the effective break threshold. */
   damage: Float32Array
+  /** Cluster index excluded from this member's capsule contacts, -1 for none. */
+  noCollideCluster: Int32Array
 
   constructor(capacity = 2048) {
     this.slots = new SlotAllocator(capacity)
@@ -48,6 +57,7 @@ export class DistanceConstraints {
     this.strain = new Float32Array(capacity)
     this.material = new Uint8Array(capacity)
     this.damage = new Float32Array(capacity)
+    this.noCollideCluster = new Int32Array(capacity)
     this.slots.onGrow = (cap) => this.grow(cap)
   }
 
@@ -61,6 +71,7 @@ export class DistanceConstraints {
     this.strain = SlotAllocator.growF32(this.strain, cap)
     this.material = SlotAllocator.growU8(this.material, cap)
     this.damage = SlotAllocator.growF32(this.damage, cap)
+    this.noCollideCluster = SlotAllocator.growI32(this.noCollideCluster, cap)
   }
 
   get count(): number {
@@ -86,6 +97,7 @@ export class DistanceConstraints {
     this.strain[i] = 0
     this.material[i] = spec.material ?? 0
     this.damage[i] = 0
+    this.noCollideCluster[i] = spec.noCollideCluster ?? -1
     return i
   }
 

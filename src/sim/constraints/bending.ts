@@ -10,6 +10,8 @@ export interface BendSpec {
   /** XPBD compliance in rad/(N*m). Large = bendy. This is where softness lives. */
   compliance: number
   zeta: number
+  /** Index into MATERIAL_IDS, so bends can fail and yield per material. */
+  material?: number
 }
 
 const TWO_PI = Math.PI * 2
@@ -49,6 +51,10 @@ export class BendConstraints {
   lambda: Float32Array
   /** Signed deflection from rest, radians, from the most recent solve. */
   angle: Float32Array
+  /** Index into MATERIAL_IDS. */
+  material: Uint8Array
+  /** Accumulated, irreversible. Lowers the effective break angle. */
+  damage: Float32Array
 
   constructor(capacity = 2048) {
     this.slots = new SlotAllocator(capacity)
@@ -60,6 +66,8 @@ export class BendConstraints {
     this.zeta = new Float32Array(capacity)
     this.lambda = new Float32Array(capacity)
     this.angle = new Float32Array(capacity)
+    this.material = new Uint8Array(capacity)
+    this.damage = new Float32Array(capacity)
     this.slots.onGrow = (cap) => this.grow(cap)
   }
 
@@ -72,6 +80,8 @@ export class BendConstraints {
     this.zeta = SlotAllocator.growF32(this.zeta, cap)
     this.lambda = SlotAllocator.growF32(this.lambda, cap)
     this.angle = SlotAllocator.growF32(this.angle, cap)
+    this.material = SlotAllocator.growU8(this.material, cap)
+    this.damage = SlotAllocator.growF32(this.damage, cap)
   }
 
   get count(): number {
@@ -96,6 +106,8 @@ export class BendConstraints {
     this.zeta[i] = spec.zeta
     this.lambda[i] = 0
     this.angle[i] = 0
+    this.material[i] = spec.material ?? 0
+    this.damage[i] = 0
     return i
   }
 

@@ -33,10 +33,6 @@ export class Rng {
   int(minInclusive: number, maxExclusive: number): number {
     return Math.floor(this.range(minInclusive, maxExclusive))
   }
-
-  fork(): Rng {
-    return new Rng((this.next() * 4294967296) >>> 0)
-  }
 }
 
 /**

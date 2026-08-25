@@ -144,6 +144,7 @@ export function buildBeam(sim: SimWorld, opts: BeamOptions): Beam {
         restAngle: 0,
         compliance: bendAlpha,
         zeta: zetaBend,
+        material: matIdx,
       }),
     )
   }
@@ -165,6 +166,7 @@ export function buildBeam(sim: SimWorld, opts: BeamOptions): Beam {
         restAngle: 0,
         compliance: bendAlpha,
         zeta: zetaBend,
+        material: matIdx,
       }),
     )
   }

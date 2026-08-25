@@ -1,4 +1,5 @@
 import { KIND_FLUID, KIND_NODE, KIND_OBJECT } from '../../src/sim/particles'
+import { materialAt } from '../../src/sim/materials'
 import type { SimWorld } from '../../src/sim/world'
 
 /**
@@ -261,6 +262,38 @@ export function peakMemberLoad(sim: SimWorld): number {
     const rest = d.rest[i]!
     if (rest <= 0) continue // welds carry no meaningful strain
     peak = Math.max(peak, Math.abs(d.strain[i]!))
+  }
+  return peak
+}
+
+/** Peak |angle| / breakAngle across live bends - the load fraction in BENDING. */
+export function peakBendLoad(sim: SimWorld): number {
+  const b = sim.bend
+  let peak = 0
+  for (let i = 0; i < b.highWater; i++) {
+    if (b.slots.alive[i] !== 1) continue
+    const m = materialAt(b.material[i]!)
+    if (!(m.breakAngle > 0) || !Number.isFinite(m.breakAngle)) continue
+    peak = Math.max(peak, Math.abs(b.angle[i]!) / m.breakAngle)
+  }
+  return peak
+}
+
+/**
+ * Peak load fraction across BOTH failure modes - axial strain against
+ * breakStrain and bend angle against breakAngle. A wall holding back water
+ * carries its load in bending; a hanger carries it axially. Asserting on one
+ * mode alone reports a loaded structure as idle.
+ */
+export function peakStructuralLoad(sim: SimWorld): number {
+  const d = sim.distance
+  let peak = peakBendLoad(sim)
+  for (let i = 0; i < d.highWater; i++) {
+    if (d.slots.alive[i] !== 1) continue
+    if (d.rest[i]! <= 0) continue
+    const m = materialAt(d.material[i]!)
+    if (m.breakStrain <= 0) continue
+    peak = Math.max(peak, Math.abs(d.strain[i]!) / m.breakStrain)
   }
   return peak
 }

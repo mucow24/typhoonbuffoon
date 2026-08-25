@@ -30,6 +30,14 @@ interface MemberSim {
   nodes: number[]
   distances: number[]
   bends: number[]
+  /**
+   * The two stiff zero-rest welds binding the beam's ends to the graph nodes.
+   * Tracked so despawn can destroy them: a leaked weld outlives its member,
+   * and the freed particle slots it references are recycled by the next
+   * create - during a flood, into water particles, leaving a water particle
+   * rigidly and unbreakably welded to the structure.
+   */
+  welds: number[]
 }
 
 /**
@@ -37,15 +45,21 @@ interface MemberSim {
  * the two in step while the sim runs.
  *
  * The document is authoritative and the sim world is a projection of it; sim
- * state never writes back. Play SNAPSHOTS the solution rather than treating the
- * world as one-shot, because building is allowed during the sim - edits mutate
- * the live world and the working solution together, and the snapshot is what
- * makes Reset still mean something.
+ * state never writes back. Play SNAPSHOTS the whole editable state - solution
+ * AND document - rather than treating the world as one-shot, because building
+ * is allowed during the sim: edits mutate the live world and the working
+ * state together, and the snapshot is what makes Reset still mean something.
  */
 export class Session {
   solution: Solution = emptySolution()
 
-  private snapshot: Solution | null = null
+  /**
+   * Play snapshots the WHOLE editable state, doc included - anchors and world
+   * objects live in the document and the player's tools stay live during the
+   * sim, so a solution-only snapshot let mid-run anchor edits survive Reset
+   * and left members billed for but unable to spawn.
+   */
+  private snapshot: EditSnapshot | null = null
   private readonly nodeSim = new Map<string, number>()
   private readonly memberSim = new Map<string, MemberSim>()
   private readonly objectSim = new Map<string, Cluster>()
@@ -62,9 +76,18 @@ export class Session {
 
   // ---------------------------------------------------------------- building
 
-  /** Rebuild the whole sim world from the document plus the current solution. */
+  /**
+   * Rebuild the built world from the document plus the current solution.
+   *
+   * FLUID SURVIVES. Undo, redo and anchor/object deletion all come through
+   * here, and they are build edits - clearing the water too meant Ctrl+Z
+   * during a flood deleted thousands of particles and un-flooded the level,
+   * with a multi-second refill at the admission rate. Accumulated damage and
+   * plastic set do reset with the structures; a rebuild is a state jump for
+   * the build, exact water history is not part of its contract.
+   */
   rebuild(): void {
-    this.sim.clear()
+    this.sim.clearStructures()
     this.nodeSim.clear()
     this.memberSim.clear()
     this.objectSim.clear()
@@ -152,14 +175,58 @@ export class Session {
     const stiff = { compliance: 1e-9, zeta: 0.95 }
     const first = beam.nodes[0]!
     const last = beam.nodes[beam.nodes.length - 1]!
-    this.sim.distance.create({ a: ia, b: first, rest: 0, ...stiff })
-    this.sim.distance.create({ a: ib, b: last, rest: 0, ...stiff })
+    const weldA = this.sim.distance.create({ a: ia, b: first, rest: 0, ...stiff })
+    const weldB = this.sim.distance.create({ a: ib, b: last, rest: 0, ...stiff })
+
+    // A member bolted to an object must not collide with that object - the
+    // capsule would fight the weld and pump energy until the object flipped.
+    // (A member bridging two different objects keeps only one exclusion; that
+    // configuration is rare enough to accept the fight on the second joint.)
+    let noCollide = -1
+    for (const end of [member.a, member.b]) {
+      const anchor = this.doc.anchors.find((a) => a.id === end)
+      if (anchor?.attachedTo) {
+        const cluster = this.objectSim.get(anchor.attachedTo)
+        if (cluster) {
+          const idx = this.sim.clusterIndexOf(cluster)
+          if (idx >= 0) noCollide = idx
+        }
+      }
+    }
+    if (noCollide >= 0) {
+      for (const di of beam.distances) this.sim.distance.noCollideCluster[di] = noCollide
+    }
 
     this.memberSim.set(member.id, {
       nodes: beam.nodes,
       distances: beam.distances,
       bends: beam.bends,
+      welds: [weldA, weldB],
     })
+  }
+
+  /**
+   * Drop constraint indices the sim destroyed by breakage from our records.
+   *
+   * MUST run every frame (and defensively before any despawn): a freed index
+   * is recycled by the next create, and a stale record then points at an
+   * unrelated live constraint - destroying "our" indices on member delete was
+   * silently killing segments of newer members, with no break event.
+   */
+  syncBreaks(): void {
+    const destroyed = this.sim.drainDestroyed()
+    if (destroyed.distance.length === 0 && destroyed.bends.length === 0) return
+    const dSet = new Set(destroyed.distance)
+    const bSet = new Set(destroyed.bends)
+    for (const sim of this.memberSim.values()) {
+      if (dSet.size > 0) {
+        sim.distances = sim.distances.filter((i) => !dSet.has(i))
+        sim.welds = sim.welds.filter((i) => !dSet.has(i))
+      }
+      if (bSet.size > 0) {
+        sim.bends = sim.bends.filter((i) => !bSet.has(i))
+      }
+    }
   }
 
   // ------------------------------------------------------------ live editing
@@ -195,9 +262,13 @@ export class Session {
   }
 
   private despawnMember(id: string): void {
+    // Records may hold indices the sim freed by breakage this frame; acting
+    // on them would destroy whatever recycled those slots.
+    this.syncBreaks()
     const sim = this.memberSim.get(id)
     if (!sim) return
     for (const d of sim.distances) this.sim.distance.destroy(d)
+    for (const w of sim.welds) this.sim.distance.destroy(w)
     for (const b of sim.bends) this.sim.bend.destroy(b)
     for (const n of sim.nodes) this.sim.particles.destroy(n)
     this.memberSim.delete(id)
@@ -298,17 +369,23 @@ export class Session {
   // ------------------------------------------------------------ play / reset
 
   play(): void {
-    this.snapshot = cloneSolution(this.solution)
+    this.snapshot = this.snapshotNow()
     this.running = true
   }
 
   /**
    * Restore the snapshot taken at Play and rebuild. Exact by construction: the
-   * document is never mutated by the sim, so there is no drift to reconcile.
+   * document is never mutated by the sim, and Play snapshots doc AND solution,
+   * so every edit made while running - members, anchors, objects - reverts.
+   * Reset also discards the water: it ends the storm run, unlike a build edit.
    */
   reset(): void {
-    if (this.snapshot) this.solution = cloneSolution(this.snapshot)
+    if (this.snapshot) {
+      this.solution = cloneSolution(this.snapshot.solution)
+      this.doc = cloneLevel(this.snapshot.doc)
+    }
     this.running = false
+    this.sim.clear()
     this.rebuild()
   }
 

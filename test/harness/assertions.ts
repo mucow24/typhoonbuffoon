@@ -172,17 +172,31 @@ export function expectNear(
   expect(delta).toBeLessThanOrEqual(allowed)
 }
 
-/** Ordering assertion, for "more load must mean more deflection" style checks. */
+/**
+ * Ordering assertion, for "more load must mean more deflection" style checks.
+ *
+ * STRICT: ties fail. The one test written to catch the wall feeling no water
+ * passed for months because equal values counted as "increasing" - a metric
+ * pinned at zero satisfies a non-strict ordering perfectly. A physical
+ * response to a stronger cause must actually be larger; pass `byFactor` to
+ * demand each step exceed the last by a margin.
+ */
 export function expectMonotonic(
   values: number[],
   direction: 'increasing' | 'decreasing',
   label: string,
+  opts: { byFactor?: number } = {},
 ): void {
+  const factor = opts.byFactor ?? 1
   for (let i = 1; i < values.length; i++) {
-    const ok = direction === 'increasing' ? values[i]! >= values[i - 1]! : values[i]! <= values[i - 1]!
+    const prev = values[i - 1]!
+    const cur = values[i]!
+    const ok = direction === 'increasing' ? cur > prev * factor : cur < prev / factor
     if (!ok) {
       throw new Error(
-        `${label} was not ${direction}: [${values.map(fmt).join(', ')}] breaks at index ${i}`,
+        `${label} was not strictly ${direction}` +
+          (factor !== 1 ? ` (by factor ${factor})` : '') +
+          `: [${values.map(fmt).join(', ')}] breaks at index ${i}`,
       )
     }
   }

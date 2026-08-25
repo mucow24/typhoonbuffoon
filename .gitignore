@@ -8,3 +8,6 @@ dist-ssr/
 .env
 .env.*
 !.env.example
+
+# Session-local scratch (artifact sources etc.)
+.claude/tmp/

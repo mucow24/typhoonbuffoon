@@ -15,9 +15,9 @@ jobs:
   ci:
     name: typecheck, test, build
     runs-on: ubuntu-latest
-    # The physics suite simulates minutes of world time; locally it is ~3.5
+    # The physics suite simulates minutes of world time; locally it is ~7-8
     # minutes and a CI runner is slower. Generous, but it should never be hit.
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
