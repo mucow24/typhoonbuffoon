@@ -110,6 +110,11 @@ export class SimWorld {
   maxSpeed = 45
   /** Water density for buoyancy, kg/m^3. */
   waterDensity = 1000
+  /**
+   * Ceiling on an object particle's gross buoyant acceleration, m/s^2 (~4g).
+   * Only very light objects deep underwater reach it - see applyBuoyancy.
+   */
+  maxObjectBuoyantAccel = 40
   /** Fraction of a contact penetration resolved per substep. */
   contactRelaxation = 0.35
   /** How much of the inbound normal velocity a contact removes, 0..1. */
@@ -200,8 +205,29 @@ export class SimWorld {
     this.rebuildTerrainBoundary()
   }
 
+  /**
+   * Per-pass wall-clock totals for the last step, ms. Populated only while
+   * `profileEnabled` is true - the timing calls themselves cost real time at
+   * 12 substeps. For the debug HUD and the perf harness.
+   */
+  readonly profile: Record<string, number> = {}
+  profileEnabled = false
+
   step(dt: number): void {
+    const prof = this.profileEnabled ? this.profile : null
+    if (prof) for (const k of Object.keys(prof)) prof[k] = 0
+    let t0 = 0
+    const mark = prof ? () => (t0 = performance.now()) : () => {}
+    const lap = prof
+      ? (key: string) => {
+          const t1 = performance.now()
+          prof[key] = (prof[key] ?? 0) + (t1 - t0)
+          t0 = t1
+        }
+      : () => {}
+
     this.ensureTerrainBoundary()
+    mark()
     const h = dt / this.substeps
     this.water.build(
       this.particles,
@@ -209,14 +235,19 @@ export class SimWorld {
       this.boundsX1,
       this.fluid.spacing * this.fluid.spacing,
     )
+    lap('waterField')
     this.applyBuoyancy()
     this.applyHydrostaticLoad()
     this.applyWaterDrag(dt)
     this.wind.advance(dt)
     this.applyWind()
+    lap('forces')
     this.fluid.beginFrame(this.particles)
+    lap('neighbours')
     for (let s = 0; s < this.substeps; s++) {
+      mark()
       this.predict(h)
+      lap('predict')
       this.bend.resetLambda()
       this.distance.resetLambda()
       // Bending first, axial last: in Gauss-Seidel the last solve dominates
@@ -231,27 +262,35 @@ export class SimWorld {
       for (const c of this.clusters) if (c.alive) c.solve(this.particles)
       this.bend.solve(this.particles, h)
       this.distance.solve(this.particles, h)
+      lap('structure')
       // EVERY substep. Projecting on every third one let density error build
       // across two unpressurised substeps and then discharged it in a single
       // correction, which (x - x_prev)/h turns into a velocity three times too
       // large before the tiny substep h multiplies it again. Small steps only
       // work when every step is corrected.
       this.fluid.project(this.particles, h)
+      lap('project')
       this.beginContacts()
       this.solveSolidContacts()
+      lap('solidContacts')
       this.solveMemberContacts()
+      lap('memberContacts')
       this.resolveContacts()
       this.resolveMemberReactions()
       this.solveContacts()
+      lap('terrain')
       this.updateVelocities(h)
       this.bend.dampVelocities(this.particles, h)
       this.distance.dampVelocities(this.particles, h)
       this.fluid.applyHullViscosity(this.particles)
       if (this.fluid.viscosityEverySubstep) this.fluid.applyViscosity(this.particles)
+      lap('velocities')
     }
+    mark()
     if (!this.fluid.viscosityEverySubstep) this.fluid.applyViscosity(this.particles)
     this.clearAccelerations()
     this.updateDamage(dt)
+    lap('frameTail')
   }
 
   private predict(h: number): void {
@@ -438,6 +477,18 @@ export class SimWorld {
         const wet = this.fluid.solidWetCount[i] ?? 0
         frac *= Math.min(1, wet / 8)
         if (frac <= 0) continue
+        const mass = 1 / p.invMass[i]!
+        // Capped: a very light object fully submerged would otherwise pull
+        // 6-7g of lift, and lift is an external force the water pays nothing
+        // for - deep-dunked light objects became depth-charge cannons. Real
+        // rise is drag-limited; the cap plays that role at the accel level
+        // and the hull viscosity does the rest.
+        const lift = Math.min(
+          g * ((this.waterDensity * vol) / mass) * frac,
+          this.maxObjectBuoyantAccel,
+        )
+        p.accY[i]! += lift
+        continue
       }
 
       const mass = 1 / p.invMass[i]!

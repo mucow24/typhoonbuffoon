@@ -22,6 +22,17 @@ export interface LoopOptions {
    * queue up hundreds of steps.
    */
   maxFrameMs?: number
+  /**
+   * Most fixed steps one frame may run. THE overload valve: when a step costs
+   * more than the frame budget, wall-clock debt accrues faster than steps can
+   * pay it down, and an uncapped (or generously capped) catch-up loop makes
+   * every frame slower than the last until it pins at maxFrameMs' worth of
+   * steps - measured in the app as a 60%-over-budget sim becoming a sub-1-fps
+   * freeze. Beyond this many steps the remaining debt is DROPPED: the game
+   * runs in slow motion and stays responsive. Small hiccups (a dropped frame
+   * or two) still catch up fully.
+   */
+  maxCatchUpSteps?: number
   fixedUpdate(dt: number): void
   /** `alpha` is the 0..1 interpolation factor between the last two fixed states. */
   render(alpha: number, stats: Readonly<LoopStats>): void
@@ -35,6 +46,7 @@ export interface LoopOptions {
 export class GameLoop {
   readonly fixedDt: number
   private readonly maxFrameMs: number
+  private readonly maxCatchUpSteps: number
   private readonly fixedUpdate: (dt: number) => void
   private readonly renderFn: (alpha: number, stats: Readonly<LoopStats>) => void
 
@@ -55,6 +67,7 @@ export class GameLoop {
   constructor(opts: LoopOptions) {
     this.fixedDt = 1 / (opts.fixedHz ?? 60)
     this.maxFrameMs = opts.maxFrameMs ?? 250
+    this.maxCatchUpSteps = Math.max(1, opts.maxCatchUpSteps ?? 3)
     this.fixedUpdate = opts.fixedUpdate
     this.renderFn = opts.render
   }
@@ -72,8 +85,7 @@ export class GameLoop {
   start(): void {
     if (this.running) return
     this.running = true
-    this.lastTime = performance.now()
-    this.accumulator = 0
+    this.beginFrames(performance.now())
     this.rafHandle = requestAnimationFrame(this.tick)
   }
 
@@ -83,32 +95,54 @@ export class GameLoop {
     this.rafHandle = 0
   }
 
-  private tick = (now: number): void => {
-    if (!this.running) return
-    this.rafHandle = requestAnimationFrame(this.tick)
+  /** Reset frame timing so the next advance() measures from `now`. */
+  beginFrames(now: number): void {
+    this.lastTime = now
+    this.accumulator = 0
+  }
 
+  /**
+   * One frame's worth of work at wall-clock time `now` (ms). Extracted from
+   * the rAF callback so the loop's overload behaviour is testable - the
+   * accumulator maths is exactly the kind of logic that quietly turns "a bit
+   * over budget" into "frozen for many seconds".
+   */
+  advance(now: number): void {
     let frameMs = now - this.lastTime
     this.lastTime = now
 
-    const starved = frameMs > this.maxFrameMs
+    let starved = frameMs > this.maxFrameMs
     if (starved) frameMs = this.maxFrameMs
 
     this.stats.frameMs = frameMs
     this.stats.smoothedFrameMs = this.stats.smoothedFrameMs === 0
       ? frameMs
       : this.stats.smoothedFrameMs * 0.9 + frameMs * 0.1
-    this.stats.starved = starved
 
     this.accumulator += frameMs / 1000
 
     let steps = 0
-    while (this.accumulator >= this.fixedDt) {
+    while (this.accumulator >= this.fixedDt && steps < this.maxCatchUpSteps) {
       this.step()
       this.accumulator -= this.fixedDt
       steps++
     }
+    // Debt we chose not to run is dropped, not carried: carrying it means the
+    // next frame starts behind too, and an over-budget sim never sees a
+    // healthy frame again. Dropping it is the slow-motion contract.
+    if (this.accumulator >= this.fixedDt) {
+      this.accumulator = this.accumulator % this.fixedDt
+      starved = true
+    }
     this.stats.stepsLastFrame = steps
+    this.stats.starved = starved
 
     this.renderFn(this.accumulator / this.fixedDt, this.stats)
+  }
+
+  private tick = (now: number): void => {
+    if (!this.running) return
+    this.rafHandle = requestAnimationFrame(this.tick)
+    this.advance(now)
   }
 }

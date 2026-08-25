@@ -179,12 +179,13 @@ describe('buoyancy', () => {
     fillWater(sim, { x0: -12, x1: 12, yTop: 0 })
     settle(sim, 10)
     const box = sim.addObject({ cx: 0, cy: -5, width: 2, height: 1.2, density: 300 })
-    settle(sim, 30)
+    settle(sim, 40)
 
     const surface = (surfaceMean(sim, -10, -2) + surfaceMean(sim, 2, 10)) / 2
     // Up from -5 to the neighbourhood of the surface - not pinned at depth,
     // not launched into orbit. The rise is deliberately unhurried (hull
-    // viscosity entrains a water plug), hence the 30 s.
+    // viscosity entrains a water plug, and the buoyant-acceleration cap
+    // plays the role of drag-limited rise), hence the 40 s.
     expect(box.cy).toBeGreaterThan(-2)
     expect(Math.abs(box.cy - surface)).toBeLessThan(1.5)
   })

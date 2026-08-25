@@ -115,7 +115,12 @@ export class Game {
     this.hud
       .add('frame', () => `${this.loop.stats.smoothedFrameMs.toFixed(1)} ms`)
       .add('fps', () => `${(1000 / Math.max(this.loop.stats.smoothedFrameMs, 0.001)).toFixed(0)}`)
-      .add('state', () => (this.paused ? 'PAUSED' : 'running'))
+      .add('state', () => {
+        if (this.paused) return 'PAUSED'
+        // The loop drops sim time rather than spiralling when a step costs
+        // more than the frame budget; say so, or heavy scenes read as broken.
+        return this.loop.stats.starved ? 'running (slow-mo)' : 'running'
+      })
       .add('substeps', () => String(this.sim.substeps))
       .add('field', () => `${this.field.widthM.toFixed(0)} m`)
       .add('particles', () => String(this.sim.particles.count))
