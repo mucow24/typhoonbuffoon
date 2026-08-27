@@ -106,7 +106,14 @@ export const MATERIALS: Record<MaterialId, Material> = {
     density: 7850, // sinks
     section: 0.14,
     costPerMetre: 34,
-    flexuralRigidity: 1.2e7,
+    // An I-SECTION's rigidity, not a solid bar's. At the old 1.2e7 steel had
+    // the EI of a solid 14 cm rod while carrying full 7850-density weight -
+    // measured: a 12 m steel brace sagged 3.6 cm under its own weight, TWICE
+    // what the same wood member did (steel is 3.4x heavier per metre and was
+    // only 1.8x stiffer). Structural steel must read rigid: at 1e8 the same
+    // brace sags ~4 mm and a 20 m span ~3 cm, while wood keeps its visible,
+    // deliberate palm-bend.
+    flexuralRigidity: 1e8,
     axialStrengthN: 1.5e6,
     breakStrain: 0.015,
     yieldStrain: 0.008, // yields, then stays bent - it warns you before it goes

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { buildBeam } from '../../src/scenes/demos'
+import { Field } from '../../src/world/field'
+import { Session } from '../../src/game/session'
+import { defaultLevel } from '../../src/model/level'
 import { MATERIALS } from '../../src/sim/materials'
 import {
   analyticCantileverTip,
@@ -276,6 +279,56 @@ describe('wood strength', () => {
     const before = sim.distance.count
     settle(sim, 15)
     expect(sim.distance.count).toBeLessThan(before)
+  })
+})
+
+describe('self-weight sag', () => {
+  /**
+   * A horizontal brace between two anchors, built through the SESSION - the
+   * production path, welds and joint masses included - hanging over deep
+   * ground. The measured sim tracks Euler-Bernoulli pin-pin within ~10%, so
+   * these bars are really about the MATERIAL constants reading right on
+   * screen. Method: red-first - before the I-section EI correction, steel
+   * sagged 3.6 cm here (over the 2 cm bar) and sagged MORE than wood.
+   */
+  const braceSag = (material: 'wood' | 'steel', L: number) => {
+    const field = new Field(120)
+    const sim = makeWorld({ widthM: 120, spacing: 0.25, terrain: flatTerrain(120, -30) })
+    const session = new Session(defaultLevel(field.widthM), sim, field)
+    const a = session.addAnchor(-L / 2, 0)
+    const b = session.addAnchor(L / 2, 0)
+    session.addMember(a, b, material)
+    for (let f = 0; f < 60 * 15; f++) sim.step(1 / 60)
+    const p = sim.particles
+    let minY = Infinity
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== 0) continue
+      minY = Math.min(minY, p.posY[i]!)
+    }
+    return -minY
+  }
+
+  it('a 12 m steel cross-brace reads dead straight', () => {
+    // Structural steel is I-section: rigidity out of proportion to a solid
+    // bar. 5 mm measured; 2 cm allowed; the pre-fix 3.6 cm was a visible
+    // droop that made steel read as rubber.
+    expect(braceSag('steel', 12)).toBeLessThan(0.02)
+  })
+
+  it('steel sags less than wood at equal span, despite weighing 3.4x more', () => {
+    // The player-intuition invariant. Pre-fix it was backwards: steel EI was
+    // barely above wood's while its weight was triple, so the "strong"
+    // material drooped twice as far.
+    expect(braceSag('steel', 12)).toBeLessThan(braceSag('wood', 12))
+  })
+
+  it('wood keeps its deliberate visible bend', () => {
+    // The palm-tree feel is a design pillar, not an accident - a 12 m wood
+    // span should bow perceptibly (about 2 cm measured) without drooping
+    // like rope. Guards both directions.
+    const sag = braceSag('wood', 12)
+    expect(sag).toBeGreaterThan(0.008)
+    expect(sag).toBeLessThan(0.06)
   })
 })
 
