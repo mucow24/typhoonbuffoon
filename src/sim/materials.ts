@@ -34,6 +34,16 @@ export interface Material {
   /** How fast rest length migrates once yielding. 0 disables. */
   plasticRate: number
   /**
+   * Ductility budget: how far the rest length may migrate from its original
+   * (as a fraction) before the member breaks. Real metal has finite
+   * elongation; unbounded creep left violently-deformed fragments with
+   * mutually contradictory rest states that buzzed and spun at the speed cap
+   * forever - the "spinning stars" debris.
+   */
+  maxPlasticStrain: number
+  /** Same budget for the rest ANGLE of a yielded joint, radians. */
+  maxPlasticAngle: number
+  /**
    * Bend angle per joint, radians, at which the member snaps in BENDING.
    * Without this a member can only fail by elongation, and a mast hit
    * broadside by wind or wave rotates without stretching - it could bend
@@ -73,6 +83,8 @@ export const MATERIALS: Record<MaterialId, Material> = {
     breakStrain: 0.03, // stretches visibly near failure, then snaps with no warning
     yieldStrain: Infinity, // near-linear-elastic to fracture; never takes a set
     plasticRate: 0,
+    maxPlasticStrain: 0, // moot: wood never yields
+    maxPlasticAngle: 0,
     breakAngle: 0.28, // bows legibly, then snaps
     yieldAngle: Infinity,
     zetaAxial: 0.9,
@@ -99,6 +111,8 @@ export const MATERIALS: Record<MaterialId, Material> = {
     breakStrain: 0.015,
     yieldStrain: 0.008, // yields, then stays bent - it warns you before it goes
     plasticRate: 0.6,
+    maxPlasticStrain: 0.05, // stretches 5% permanently, then tears
+    maxPlasticAngle: 0.5,
     breakAngle: 0.6,
     yieldAngle: 0.12, // takes a visible permanent set long before it fails
     zetaAxial: 0.95,

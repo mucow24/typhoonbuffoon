@@ -1,4 +1,5 @@
-import { MATERIALS, segmentsFor, type MaterialId } from '../sim/materials'
+import { MATERIALS, massPerMetre, segmentsFor, type MaterialId } from '../sim/materials'
+import { KIND_NODE } from '../sim/particles'
 import type { Cluster } from '../sim/clusters'
 import type { SimWorld } from '../sim/world'
 import { buildBeam } from '../scenes/demos'
@@ -110,16 +111,23 @@ export class Session {
   }
 
   /**
-   * A terrain anchor is a pinned particle. An object anchor is NOT a new
-   * particle - it reuses the nearest particle of the object's cluster, so load
-   * genuinely transfers into the object. Pinning a separate particle beside the
-   * object would let a house hover with no stilts under it.
+   * A terrain anchor is a pinned particle. An object anchor is a MOUNT: a
+   * dedicated node tied to the object's three nearest cluster particles by
+   * triangulated stiff links, so load genuinely transfers into the object.
+   *
+   * Earlier versions reused a cluster particle directly, which put that one
+   * particle under two rigid masters - the member's weld and the shape
+   * matcher - and the sequential fight between them rang a steel-braced
+   * house at 2-5 m/s indefinitely. The mount keeps every master inside the
+   * one constraint solver (the plan's 5.8 always said anchors bind to the
+   * object's FRAME, not to an individual particle), and spreads the load
+   * across several particles instead of gouging one.
    */
   private spawnAnchor(anchor: AnchorDoc): void {
     if (anchor.attachedTo) {
       const cluster = this.objectSim.get(anchor.attachedTo)
       if (cluster) {
-        const i = this.nearestClusterParticle(cluster, anchor.x, anchor.y)
+        const i = this.spawnMount(cluster, anchor.x, anchor.y)
         if (i >= 0) {
           this.nodeSim.set(anchor.id, i)
           return
@@ -130,19 +138,39 @@ export class Session {
     this.nodeSim.set(anchor.id, i)
   }
 
-  private nearestClusterParticle(cluster: Cluster, x: number, y: number): number {
+  private spawnMount(cluster: Cluster, x: number, y: number): number {
     const p = this.sim.particles
-    let best = -1
-    let bestD = Infinity
+    const near: { i: number; d: number }[] = []
     for (const i of cluster.particles) {
       if (p.slots.alive[i] !== 1) continue
-      const d = (p.posX[i]! - x) ** 2 + (p.posY[i]! - y) ** 2
-      if (d < bestD) {
-        bestD = d
-        best = i
-      }
+      near.push({ i, d: (p.posX[i]! - x) ** 2 + (p.posY[i]! - y) ** 2 })
     }
-    return best
+    if (near.length === 0) return -1
+    near.sort((a, b) => a.d - b.d)
+    const chosen = near.slice(0, Math.min(3, near.length))
+
+    // The mount weighs like the bit of object it bolts to.
+    const mount = this.sim.particles.create({
+      x,
+      y,
+      invMass: p.invMass[chosen[0]!.i]!,
+      radius: 0.16,
+    })
+    const clusterIdx = this.sim.clusterIndexOf(cluster)
+    for (const { i } of chosen) {
+      this.sim.distance.create({
+        a: mount,
+        b: i,
+        rest: Math.hypot(p.posX[i]! - x, p.posY[i]! - y),
+        compliance: 2e-8,
+        zeta: 0.95,
+        unbreakable: true,
+        // A mount link is joinery INSIDE the object's footprint; its capsule
+        // must not shove the very particles it ties together.
+        noCollideCluster: clusterIdx,
+      })
+    }
+    return mount
   }
 
   private spawnNode(id: string, x: number, y: number): number {
@@ -158,21 +186,44 @@ export class Session {
     if (ia === undefined || ib === undefined) return
 
     const mat = MATERIALS[member.material]
+    const length = Math.hypot(p.posX[ib]! - p.posX[ia]!, p.posY[ib]! - p.posY[ia]!)
+    const segments = member.segments ?? segmentsFor(mat, length)
     const beam = buildBeam(this.sim, {
       x0: p.posX[ia]!,
       y0: p.posY[ia]!,
       x1: p.posX[ib]!,
       y1: p.posY[ib]!,
       material: member.material,
-      segments:
-        member.segments ??
-        segmentsFor(mat, Math.hypot(p.posX[ib]! - p.posX[ia]!, p.posY[ib]! - p.posY[ia]!)),
+      segments,
     })
+
+    // The joint must weigh at least what the member ends bolted to it weigh.
+    // A 40 kg default node welded rigidly between 400 kg steel segment ends
+    // is the classic XPBD mass-ratio instability: sequential stiff constraints
+    // tug the light puppet between their targets and PUMP energy - measured
+    // on the reported tower, self-exciting at ~40% per frame from rest (in
+    // vacuum, with gravity off) until 13 members snapped. Matching the joint
+    // mass to its members kills the instability outright; physically, the
+    // gusset weighs like the steel it joins. Mass only ever rises, and never
+    // for pinned anchors.
+    //
+    // NEVER for cluster particles either: the shape-matching caches per-
+    // particle masses at construction, and mutating p.invMass under it makes
+    // constraints and cluster disagree about the same particle's inertia -
+    // measured as the house-anchored variant of the same pump. An object
+    // anchor does not need the bump anyway: the cluster's rigidity gives its
+    // particles the whole object's effective inertia.
+    const endMass = Math.max(0.01, massPerMetre(mat) * (length / Math.max(1, segments)))
+    for (const end of [ia, ib]) {
+      if (p.kind[end] !== KIND_NODE) continue
+      const w = p.invMass[end]!
+      if (w > 0) p.invMass[end] = Math.min(w, 1 / endMass)
+    }
 
     // Weld the beam's own endpoints onto the graph nodes with stiff links,
     // rather than trying to reuse the node particles directly - it keeps the
     // beam's internal spacing uniform whatever the node positions are.
-    const stiff = { compliance: 1e-9, zeta: 0.95 }
+    const stiff = { compliance: 1e-9, zeta: 0.95, unbreakable: true }
     const first = beam.nodes[0]!
     const last = beam.nodes[beam.nodes.length - 1]!
     const weldA = this.sim.distance.create({ a: ia, b: first, rest: 0, ...stiff })

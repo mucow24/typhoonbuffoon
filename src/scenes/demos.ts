@@ -8,6 +8,7 @@ import {
   segmentsFor,
   type MaterialId,
 } from '../sim/materials'
+import { BendConstraints } from '../sim/constraints/bending'
 import type { SimWorld } from '../sim/world'
 
 export interface ChainOptions {
@@ -107,10 +108,23 @@ export function buildBeam(sim: SimWorld, opts: BeamOptions): Beam {
   const nodes: number[] = []
   for (let i = 0; i <= n; i++) {
     const pinned = (i === 0 && opts.pinStart) || (i === n && opts.pinEnd)
+    const x = opts.x0 + ux * spacing * i
+    let y = opts.y0 + uy * spacing * i
+    // A member drawn through a dune must CONFORM to the ground, not spawn
+    // buried in it: a buried node in series with a near-rigid axial chain is
+    // an energy pump the moment the terrain pass starts heaving it out (a
+    // resting steel tower went from zero to the speed cap and 18 snapped
+    // members in a quarter of a second). Endpoints stay where the player put
+    // them; interior nodes drape over the ground, and the rest state below
+    // is computed FROM the draped shape, so conforming carries no built-in
+    // strain.
+    if (sim.terrain && i > 0 && i < n) {
+      y = Math.max(y, sim.terrain.heightAt(x) + radius)
+    }
     nodes.push(
       p.create({
-        x: opts.x0 + ux * spacing * i,
-        y: opts.y0 + uy * spacing * i,
+        x,
+        y,
         invMass: pinned ? 0 : 1 / nodeMass,
         radius,
         // Rest volume: the member's cross-section times the length this node
@@ -122,11 +136,16 @@ export function buildBeam(sim: SimWorld, opts: BeamOptions): Beam {
 
   const distances: number[] = []
   for (let i = 0; i < n; i++) {
+    const ia = nodes[i]!
+    const ib = nodes[i + 1]!
     distances.push(
       sim.distance.create({
-        a: nodes[i]!,
-        b: nodes[i + 1]!,
-        rest: spacing,
+        a: ia,
+        b: ib,
+        // Rest from the ACTUAL spawned geometry - identical to `spacing` for
+        // a straight member, and the unstrained draped length where terrain
+        // conformance bent the chain.
+        rest: Math.hypot(p.posX[ib]! - p.posX[ia]!, p.posY[ib]! - p.posY[ia]!),
         compliance: axialAlpha,
         zeta: zetaAxial,
         material: matIdx,
@@ -141,7 +160,7 @@ export function buildBeam(sim: SimWorld, opts: BeamOptions): Beam {
         a: nodes[i]!,
         b: nodes[i + 1]!,
         c: nodes[i + 2]!,
-        restAngle: 0,
+        restAngle: BendConstraints.turnAngle(p, nodes[i]!, nodes[i + 1]!, nodes[i + 2]!),
         compliance: bendAlpha,
         zeta: zetaBend,
         material: matIdx,

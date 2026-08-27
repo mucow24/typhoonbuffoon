@@ -168,6 +168,7 @@ export class Game {
     let peak = 0
     for (let i = 0; i < d.highWater; i++) {
       if (d.slots.alive[i] !== 1) continue
+      if (d.unbreakable[i] === 1) continue // joinery: welds, mount links
       const m = materialAt(d.material[i]!)
       if (m.breakStrain <= 0) continue
       peak = Math.max(peak, Math.abs(d.strain[i]!) / m.breakStrain)

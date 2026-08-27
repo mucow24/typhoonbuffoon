@@ -259,6 +259,7 @@ export function peakMemberLoad(sim: SimWorld): number {
   let peak = 0
   for (let i = 0; i < d.highWater; i++) {
     if (d.slots.alive[i] !== 1) continue
+    if (d.unbreakable[i] === 1) continue // joinery, not structure
     const rest = d.rest[i]!
     if (rest <= 0) continue // welds carry no meaningful strain
     peak = Math.max(peak, Math.abs(d.strain[i]!))
@@ -290,6 +291,7 @@ export function peakStructuralLoad(sim: SimWorld): number {
   let peak = peakBendLoad(sim)
   for (let i = 0; i < d.highWater; i++) {
     if (d.slots.alive[i] !== 1) continue
+    if (d.unbreakable[i] === 1) continue
     if (d.rest[i]! <= 0) continue
     const m = materialAt(d.material[i]!)
     if (m.breakStrain <= 0) continue

@@ -1,0 +1,35 @@
+{
+  "level": {
+    "version": 1,
+    "name": "sandbox",
+    "widthM": 120,
+    "budget": 50000,
+    "materials": ["wood", "steel"],
+    "objects": [],
+    "anchors": [
+      { "id": "ah", "x": -12.463584201481416, "y": 3.8309684106711215, "attachedTo": null },
+      { "id": "ai", "x": -6.320157795832779, "y": 2.575517075571528, "attachedTo": null }
+    ]
+  },
+  "solution": {
+    "version": 1,
+    "nodes": [
+      { "id": "nj", "x": -12.032463269813174, "y": 11.511412532398715 },
+      { "id": "nl", "x": -5.350143100204047, "y": 11.02640518458435 },
+      { "id": "nq", "x": -5.188473984265925, "y": 18.24762405190384 },
+      { "id": "ns", "x": -11.493569505852683, "y": 18.624853633676086 }
+    ],
+    "members": [
+      { "id": "mk", "a": "ah", "b": "nj", "material": "steel" },
+      { "id": "mm", "a": "nj", "b": "nl", "material": "steel" },
+      { "id": "mn", "a": "nl", "b": "ai", "material": "steel" },
+      { "id": "mo", "a": "ai", "b": "nj", "material": "steel" },
+      { "id": "mp", "a": "ah", "b": "nl", "material": "steel" },
+      { "id": "mr", "a": "nl", "b": "nq", "material": "steel" },
+      { "id": "mt", "a": "nq", "b": "ns", "material": "steel" },
+      { "id": "mu", "a": "ns", "b": "nj", "material": "steel" },
+      { "id": "mv", "a": "nj", "b": "nq", "material": "steel" },
+      { "id": "mw", "a": "ns", "b": "nl", "material": "steel" }
+    ]
+  }
+}

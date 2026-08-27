@@ -372,6 +372,7 @@ export class SimWorld {
   private solveContacts(): void {
     const p = this.particles
     const alive = p.slots.alive
+    const kind = p.kind
     const n = p.highWater
     const t = this.terrain
     const grounded = this.grounded
@@ -412,8 +413,21 @@ export class SimWorld {
           // ny, so a vertical push overshoots on any slope - and repeatedly
           // overshooting at the foot of a bank is what kept flicking particles
           // out of an otherwise still pool.
+          // STRUCTURE nodes get a far gentler per-substep push than anything
+          // else. A node buried under a dune sits in series with near-rigid
+          // axial constraints, and a 0.35 m heave per substep against
+          // EA ~ 1e8 does work against the spring every substep - a measured
+          // energy pump that took a resting steel tower from 0 to the speed
+          // cap and 18 snapped members inside a quarter of a second.
+          // Build-time spawning keeps nodes out of the ground; this cap keeps
+          // runtime burial (collapse debris, dragged joints) resolving gently
+          // enough that the dampers win. Fluid needs the fast push to hold
+          // water, and OBJECTS keep it too: their fight is bounded by the
+          // cluster's own correction cap, and the gentle push just made a
+          // landing house grind on the slope ten times longer.
+          const pushCap = kind[i] === KIND_NODE ? this.maxTerrainPush * 0.1 : this.maxTerrainPush
           const nrm = t.normalAt(p.posX[i]!)
-          const gap = Math.min(floor - p.posY[i]!, this.maxTerrainPush)
+          const gap = Math.min(floor - p.posY[i]!, pushCap)
           const d = gap * nrm.ny
           p.posX[i]! += nrm.nx * d
           p.posY[i]! += nrm.ny * d
@@ -1144,6 +1158,7 @@ export class SimWorld {
 
     for (let i = 0; i < n; i++) {
       if (alive[i] !== 1) continue
+      if (d.unbreakable[i] === 1) continue
       const m = materialAt(d.material[i]!)
       const signed = d.strain[i]!
       const s = Math.abs(signed)
@@ -1155,10 +1170,16 @@ export class SimWorld {
       }
 
       // Permanent set past yield. Wood's yieldStrain is Infinity, so this is
-      // not merely disabled for wood - it never executes.
+      // not merely disabled for wood - it never executes. The set is BUDGETED:
+      // migrating past the material's ductility means the member tears.
       if (m.plasticRate > 0 && s > m.yieldStrain) {
         const excess = signed - Math.sign(signed) * m.yieldStrain
         d.rest[i]! += d.rest[i]! * excess * m.plasticRate * dt
+        const drift = Math.abs(d.rest[i]! - d.rest0[i]!)
+        if (drift > d.rest0[i]! * m.maxPlasticStrain) {
+          this.breakConstraint(i, signed)
+          continue
+        }
       }
 
       if (s > m.breakStrain * (1 - d.damage[i]!)) {
@@ -1187,9 +1208,14 @@ export class SimWorld {
 
       // Steel takes a permanent set in bending - the rest angle migrates
       // toward the deformed shape, so it stays bent when the load lifts.
+      // Budgeted like the axial set: a joint bent too far permanently tears.
       if (m.plasticRate > 0 && Number.isFinite(m.yieldAngle) && a > m.yieldAngle) {
         const excess = signed - Math.sign(signed) * m.yieldAngle
         b.restAngle[i]! += excess * m.plasticRate * dt
+        if (Math.abs(b.restAngle[i]! - b.restAngle0[i]!) > m.maxPlasticAngle) {
+          this.breakBend(i, signed)
+          continue
+        }
       }
 
       if (a > m.breakAngle * (1 - b.damage[i]!)) {

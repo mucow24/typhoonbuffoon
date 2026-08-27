@@ -46,6 +46,8 @@ export class BendConstraints {
   b: Int32Array
   c: Int32Array
   restAngle: Float32Array
+  /** Rest angle AT CREATION - the ductility baseline for plastic set. */
+  restAngle0: Float32Array
   compliance: Float32Array
   zeta: Float32Array
   lambda: Float32Array
@@ -62,6 +64,7 @@ export class BendConstraints {
     this.b = new Int32Array(capacity)
     this.c = new Int32Array(capacity)
     this.restAngle = new Float32Array(capacity)
+    this.restAngle0 = new Float32Array(capacity)
     this.compliance = new Float32Array(capacity)
     this.zeta = new Float32Array(capacity)
     this.lambda = new Float32Array(capacity)
@@ -76,6 +79,7 @@ export class BendConstraints {
     this.b = SlotAllocator.growI32(this.b, cap)
     this.c = SlotAllocator.growI32(this.c, cap)
     this.restAngle = SlotAllocator.growF32(this.restAngle, cap)
+    this.restAngle0 = SlotAllocator.growF32(this.restAngle0, cap)
     this.compliance = SlotAllocator.growF32(this.compliance, cap)
     this.zeta = SlotAllocator.growF32(this.zeta, cap)
     this.lambda = SlotAllocator.growF32(this.lambda, cap)
@@ -102,6 +106,7 @@ export class BendConstraints {
     this.b[i] = spec.b
     this.c[i] = spec.c
     this.restAngle[i] = spec.restAngle
+    this.restAngle0[i] = spec.restAngle
     this.compliance[i] = spec.compliance
     this.zeta[i] = spec.zeta
     this.lambda[i] = 0
