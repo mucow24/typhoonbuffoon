@@ -11,6 +11,20 @@ export interface DistanceSpec {
   zeta: number
   /** Index into MATERIAL_IDS. */
   material?: number
+  /**
+   * Cluster index this member's capsule must NOT collide with, -1 for none.
+   * A stilt bolted to a house would otherwise fight its own weld: the capsule
+   * pushes the house particles out while the weld pulls them back, and the
+   * loop pumps energy until the house flips.
+   */
+  noCollideCluster?: number
+  /**
+   * Joinery, not structure: welds and anchor-mount links never break, take no
+   * damage, and are invisible to load readouts. Their rest lengths are
+   * centimetres, so ordinary strain arithmetic would rate a 1 cm flex on a
+   * mount link as instant fracture.
+   */
+  unbreakable?: boolean
 }
 
 /**
@@ -27,6 +41,11 @@ export class DistanceConstraints {
   a: Int32Array
   b: Int32Array
   rest: Float32Array
+  /** Rest length AT CREATION - the ductility baseline. Plastic set migrates
+   *  `rest`; how far it has migrated from here is the permanent deformation,
+   *  and past the material's budget the member breaks instead of creeping
+   *  forever into an inconsistent tangle. */
+  rest0: Float32Array
   compliance: Float32Array
   zeta: Float32Array
   lambda: Float32Array
@@ -36,18 +55,25 @@ export class DistanceConstraints {
   material: Uint8Array
   /** Accumulated, irreversible. Lowers the effective break threshold. */
   damage: Float32Array
+  /** Cluster index excluded from this member's capsule contacts, -1 for none. */
+  noCollideCluster: Int32Array
+  /** 1 = joinery (weld / mount link): never breaks, never rates as load. */
+  unbreakable: Uint8Array
 
   constructor(capacity = 2048) {
     this.slots = new SlotAllocator(capacity)
     this.a = new Int32Array(capacity)
     this.b = new Int32Array(capacity)
     this.rest = new Float32Array(capacity)
+    this.rest0 = new Float32Array(capacity)
     this.compliance = new Float32Array(capacity)
     this.zeta = new Float32Array(capacity)
     this.lambda = new Float32Array(capacity)
     this.strain = new Float32Array(capacity)
     this.material = new Uint8Array(capacity)
     this.damage = new Float32Array(capacity)
+    this.noCollideCluster = new Int32Array(capacity)
+    this.unbreakable = new Uint8Array(capacity)
     this.slots.onGrow = (cap) => this.grow(cap)
   }
 
@@ -55,12 +81,15 @@ export class DistanceConstraints {
     this.a = SlotAllocator.growI32(this.a, cap)
     this.b = SlotAllocator.growI32(this.b, cap)
     this.rest = SlotAllocator.growF32(this.rest, cap)
+    this.rest0 = SlotAllocator.growF32(this.rest0, cap)
     this.compliance = SlotAllocator.growF32(this.compliance, cap)
     this.zeta = SlotAllocator.growF32(this.zeta, cap)
     this.lambda = SlotAllocator.growF32(this.lambda, cap)
     this.strain = SlotAllocator.growF32(this.strain, cap)
     this.material = SlotAllocator.growU8(this.material, cap)
     this.damage = SlotAllocator.growF32(this.damage, cap)
+    this.noCollideCluster = SlotAllocator.growI32(this.noCollideCluster, cap)
+    this.unbreakable = SlotAllocator.growU8(this.unbreakable, cap)
   }
 
   get count(): number {
@@ -80,12 +109,15 @@ export class DistanceConstraints {
     this.a[i] = spec.a
     this.b[i] = spec.b
     this.rest[i] = spec.rest
+    this.rest0[i] = spec.rest
     this.compliance[i] = spec.compliance
     this.zeta[i] = spec.zeta
     this.lambda[i] = 0
     this.strain[i] = 0
     this.material[i] = spec.material ?? 0
     this.damage[i] = 0
+    this.noCollideCluster[i] = spec.noCollideCluster ?? -1
+    this.unbreakable[i] = spec.unbreakable ? 1 : 0
     return i
   }
 

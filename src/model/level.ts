@@ -129,3 +129,28 @@ export function migrateSolution(raw: unknown): Solution {
 
 let idCounter = 0
 export const nextId = (prefix: string): string => `${prefix}${(++idCounter).toString(36)}`
+
+/**
+ * Advance the id counter past every id already in use. The counter starts at
+ * zero on every page load, so loading a saved level and then placing an anchor
+ * would otherwise mint an id the save already contains - and duplicate ids
+ * corrupt every lookup keyed on them. Call after any load.
+ */
+export function claimIds(ids: Iterable<string>): void {
+  for (const id of ids) {
+    const m = /^[a-z]+([0-9a-z]+)$/.exec(id)
+    if (!m) continue
+    const n = parseInt(m[1]!, 36)
+    if (Number.isFinite(n) && n > idCounter) idCounter = n
+  }
+}
+
+/** Every id a level+solution pair contains, for claimIds. */
+export function allIds(doc: LevelDoc, solution: Solution): string[] {
+  return [
+    ...doc.objects.map((o) => o.id),
+    ...doc.anchors.map((a) => a.id),
+    ...solution.nodes.map((n) => n.id),
+    ...solution.members.map((m) => m.id),
+  ]
+}

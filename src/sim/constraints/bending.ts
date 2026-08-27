@@ -10,6 +10,8 @@ export interface BendSpec {
   /** XPBD compliance in rad/(N*m). Large = bendy. This is where softness lives. */
   compliance: number
   zeta: number
+  /** Index into MATERIAL_IDS, so bends can fail and yield per material. */
+  material?: number
 }
 
 const TWO_PI = Math.PI * 2
@@ -44,11 +46,17 @@ export class BendConstraints {
   b: Int32Array
   c: Int32Array
   restAngle: Float32Array
+  /** Rest angle AT CREATION - the ductility baseline for plastic set. */
+  restAngle0: Float32Array
   compliance: Float32Array
   zeta: Float32Array
   lambda: Float32Array
   /** Signed deflection from rest, radians, from the most recent solve. */
   angle: Float32Array
+  /** Index into MATERIAL_IDS. */
+  material: Uint8Array
+  /** Accumulated, irreversible. Lowers the effective break angle. */
+  damage: Float32Array
 
   constructor(capacity = 2048) {
     this.slots = new SlotAllocator(capacity)
@@ -56,10 +64,13 @@ export class BendConstraints {
     this.b = new Int32Array(capacity)
     this.c = new Int32Array(capacity)
     this.restAngle = new Float32Array(capacity)
+    this.restAngle0 = new Float32Array(capacity)
     this.compliance = new Float32Array(capacity)
     this.zeta = new Float32Array(capacity)
     this.lambda = new Float32Array(capacity)
     this.angle = new Float32Array(capacity)
+    this.material = new Uint8Array(capacity)
+    this.damage = new Float32Array(capacity)
     this.slots.onGrow = (cap) => this.grow(cap)
   }
 
@@ -68,10 +79,13 @@ export class BendConstraints {
     this.b = SlotAllocator.growI32(this.b, cap)
     this.c = SlotAllocator.growI32(this.c, cap)
     this.restAngle = SlotAllocator.growF32(this.restAngle, cap)
+    this.restAngle0 = SlotAllocator.growF32(this.restAngle0, cap)
     this.compliance = SlotAllocator.growF32(this.compliance, cap)
     this.zeta = SlotAllocator.growF32(this.zeta, cap)
     this.lambda = SlotAllocator.growF32(this.lambda, cap)
     this.angle = SlotAllocator.growF32(this.angle, cap)
+    this.material = SlotAllocator.growU8(this.material, cap)
+    this.damage = SlotAllocator.growF32(this.damage, cap)
   }
 
   get count(): number {
@@ -92,10 +106,13 @@ export class BendConstraints {
     this.b[i] = spec.b
     this.c[i] = spec.c
     this.restAngle[i] = spec.restAngle
+    this.restAngle0[i] = spec.restAngle
     this.compliance[i] = spec.compliance
     this.zeta[i] = spec.zeta
     this.lambda[i] = 0
     this.angle[i] = 0
+    this.material[i] = spec.material ?? 0
+    this.damage[i] = 0
     return i
   }
 

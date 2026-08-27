@@ -184,6 +184,8 @@ export interface ObjectSpec {
    */
   spacing?: number
   stiffness?: number
+  /** Index of this cluster in the world's cluster list, stamped per particle. */
+  clusterIndex?: number
 }
 
 /** Build a rectangular physics object as a shape-matched cluster. */
@@ -209,6 +211,9 @@ export function buildObject(p: ParticleStore, spec: ObjectSpec): Cluster {
         invMass: 1 / perParticle,
         radius: Math.max(dx, dy) * 0.55,
         kind: KIND_OBJECT,
+        // Cluster membership tag; the world overwrites this with the cluster's
+        // index so contact passes can tell "same object" from "other object".
+        cluster: spec.clusterIndex ?? -1,
       })
       p.volume[i] = volumePer
       indices.push(i)

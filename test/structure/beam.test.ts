@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { buildBeam } from '../../src/scenes/demos'
+import { Field } from '../../src/world/field'
+import { Session } from '../../src/game/session'
+import { defaultLevel } from '../../src/model/level'
+import { KIND_NODE } from '../../src/sim/particles'
 import { MATERIALS } from '../../src/sim/materials'
 import {
   analyticCantileverTip,
@@ -48,33 +52,44 @@ function cantilever(opts: { length: number; loadKg: number; material?: 'wood' | 
 }
 
 describe('cantilever deflection', () => {
+  /**
+   * Baseline-subtracted: the beam sags under its own 270 kg before any load
+   * is hung on it, and Euler-Bernoulli's point-load formula knows nothing of
+   * self-weight. Measuring the INCREMENT isolates the response the formula
+   * predicts, which is what let the acceptance band tighten from the old
+   * 0.3-6x (a 20x-wide window that certified almost anything) to 2-6x.
+   */
+  const incrementalDeflection = (loadKg: number, length = 6) => {
+    const { sim, tip } = cantilever({ length, loadKg: 0 })
+    settle(sim, 20)
+    const baseline = sim.particles.posY[tip]!
+    sim.particles.invMass[tip] = 1 / (sim.particles.massOf(tip) + loadKg)
+    settle(sim, 20)
+    return baseline - sim.particles.posY[tip]!
+  }
+
   it('matches the Euler-Bernoulli tip deflection for a wooden beam', () => {
     const length = 6
     const loadKg = 400
-    const { sim, tip, startY } = cantilever({ length, loadKg })
-    settle(sim, 20)
-
-    const measured = startY - sim.particles.posY[tip]!
+    const measured = incrementalDeflection(loadKg, length)
     const analytic = analyticCantileverTip(loadKg * G, length, MATERIALS.wood.flexuralRigidity)
 
-    // A discretised beam is softer than the continuum, so a factor of a few is
-    // expected. Orders of magnitude are not.
-    expect(measured).toBeGreaterThan(analytic * 0.3)
+    // A discretised, one-iteration XPBD beam is softer than the continuum -
+    // measured factor ~3.4x. The band is calibrated around that with room for
+    // retuning, and verified red against EI halved and EI x10 (mutation).
+    expect(measured).toBeGreaterThan(analytic * 2)
     expect(measured).toBeLessThan(analytic * 6)
   })
 
   it('deflects proportionally more under proportionally more load', () => {
-    const deflect = (loadKg: number) => {
-      const { sim, tip, startY } = cantilever({ length: 6, loadKg })
-      settle(sim, 20)
-      return startY - sim.particles.posY[tip]!
-    }
-    // Linear elasticity: doubling the load doubles the deflection, until it
-    // yields or breaks. Anything wildly non-linear at modest load is a bug.
-    const a = deflect(100)
-    const b = deflect(200)
-    expectMonotonic([a, b, deflect(400)], 'increasing', 'tip deflection vs load')
-    expectNear(b / Math.max(a, 1e-9), 2, { rel: 0.6, label: 'deflection ratio for 2x load' })
+    // Linear elasticity: doubling the load doubles the incremental
+    // deflection, until it yields or breaks.
+    const a = incrementalDeflection(100)
+    const b = incrementalDeflection(200)
+    const c = incrementalDeflection(400)
+    expectMonotonic([a, b, c], 'increasing', 'tip deflection vs load')
+    expectNear(b / Math.max(a, 1e-9), 2, { rel: 0.3, label: 'deflection ratio for 2x load' })
+    expectNear(c / Math.max(b, 1e-9), 2, { rel: 0.3, label: 'deflection ratio for 4x load' })
   })
 
   it('is stiffer in steel than in wood', () => {
@@ -125,17 +140,21 @@ describe('load capacity', () => {
 
 describe('simply supported beam', () => {
   it('matches the textbook mid-span deflection', () => {
+    // Baseline-subtracted like the cantilever: settle unloaded, then hang the
+    // load, so self-weight sag does not pollute the point-load comparison.
     const length = 6
     const loadKg = 400
     const sim = makeWorld({ widthM: 60, spacing: 0.5, terrain: flatTerrain(60, -50) })
-    const beam = buildSimplySupported(sim, { length, y: 0, loadKg, segments: 8 })
-    const startY = sim.particles.posY[beam.mid]!
+    const beam = buildSimplySupported(sim, { length, y: 0, segments: 8 })
+    settle(sim, 20)
+    const baseline = sim.particles.posY[beam.mid]!
+    sim.particles.invMass[beam.mid] = 1 / (sim.particles.massOf(beam.mid) + loadKg)
     settle(sim, 20)
 
-    const measured = startY - sim.particles.posY[beam.mid]!
+    const measured = baseline - sim.particles.posY[beam.mid]!
     const analytic = analyticMidspanDeflection(loadKg * G, length, MATERIALS.wood.flexuralRigidity)
 
-    expect(measured).toBeGreaterThan(analytic * 0.3)
+    expect(measured).toBeGreaterThan(analytic * 2)
     expect(measured).toBeLessThan(analytic * 6)
   })
 
@@ -148,6 +167,169 @@ describe('simply supported beam', () => {
     settle(sim, 20)
 
     expect(peakMemberLoad(sim)).toBeLessThan(MATERIALS.wood.breakStrain * 0.75)
+  })
+})
+
+describe('bending failure', () => {
+  /**
+   * Hand-built joint: outer particles pinned, middle one massive enough that
+   * the solve barely moves it, so the recorded angle IS the imposed angle and
+   * the break logic is tested at a known input. Red-first: no bend could fail
+   * at all before this - a member could fold double and never snap.
+   */
+  function foldedJoint(sim: ReturnType<typeof makeWorld>, angle: number, material: 'wood' | 'steel') {
+    const matIdx = material === 'wood' ? 0 : 1
+    // Gravity off: the fixture holds a joint at a KNOWN angle, and the middle
+    // particle would otherwise free-fall (gravitational acceleration does not
+    // care how heavy it is).
+    sim.gravity = 0
+    const p = sim.particles
+    const a = p.create({ x: 0, y: 5, invMass: 0 })
+    const b = p.create({ x: 2, y: 5, invMass: 1e-9 })
+    const c = p.create({ x: 2 + 2 * Math.cos(angle), y: 5 + 2 * Math.sin(angle), invMass: 0 })
+    sim.distance.create({ a, b, rest: 2, compliance: 1e-7, zeta: 0.9, material: matIdx })
+    sim.distance.create({ a: b, b: c, rest: 2, compliance: 1e-7, zeta: 0.9, material: matIdx })
+    sim.bend.create({ a, b, c, restAngle: 0, compliance: 1e-6, zeta: 0.9, material: matIdx })
+    return { a, b, c }
+  }
+
+  it('a joint folded past its break angle snaps the member there', () => {
+    const sim = makeWorld({ widthM: 30, spacing: 0.5, terrain: flatTerrain(30, -20) })
+    foldedJoint(sim, 1.2, 'wood') // far past wood's 0.28 rad
+    expect(sim.bend.count).toBe(1)
+    expect(sim.distance.count).toBe(2)
+
+    sim.step(1 / 60)
+
+    // The bend breaks AND severs one adjacent segment - a fracture, not a
+    // freed hinge - and reports it.
+    expect(sim.bend.count).toBe(0)
+    expect(sim.distance.count).toBe(1)
+    expect(sim.breakEvents.length).toBeGreaterThan(0)
+  })
+
+  it('a joint within its break angle holds', () => {
+    const sim = makeWorld({ widthM: 30, spacing: 0.5, terrain: flatTerrain(30, -20) })
+    foldedJoint(sim, 0.15, 'wood') // within wood's 0.28 rad
+    for (let i = 0; i < 60; i++) sim.step(1 / 60)
+    expect(sim.bend.count).toBe(1)
+    expect(sim.distance.count).toBe(2)
+  })
+
+  it('steel takes a permanent set past its yield angle; wood does not', () => {
+    const steelSim = makeWorld({ widthM: 30, spacing: 0.5, terrain: flatTerrain(30, -20) })
+    foldedJoint(steelSim, 0.3, 'steel') // past steel's 0.12 rad yield, under 0.6 break
+    for (let i = 0; i < 60 * 3; i++) steelSim.step(1 / 60)
+    expect(steelSim.bend.count).toBe(1) // held
+    expect(Math.abs(steelSim.bend.restAngle[0]!)).toBeGreaterThan(0.05) // stayed bent
+
+    const woodSim = makeWorld({ widthM: 30, spacing: 0.5, terrain: flatTerrain(30, -20) })
+    foldedJoint(woodSim, 0.2, 'wood') // wood never yields, whatever the angle
+    for (let i = 0; i < 60 * 3; i++) woodSim.step(1 / 60)
+    expect(woodSim.bend.count).toBe(1)
+    expect(woodSim.bend.restAngle[0]!).toBe(0)
+  })
+})
+
+describe('wood strength', () => {
+  // Wood at the audit's constants had 60 kN of axial capacity - one strut
+  // could barely hold one light house, and anything working near half its
+  // strength dissolved through damage in seconds. "Tissue paper."
+  it('a 4 m wood column carries five tonnes indefinitely', () => {
+    // 5 t is 49 kN: a serious load a real 0.3 m timber post shrugs off.
+    // Method: red under the pre-fix constants - 49 kN was 82% of capacity,
+    // over the damage onset, and the column dissolved and snapped inside 15 s.
+    const sim = makeWorld({ widthM: 30, spacing: 0.5, terrain: flatTerrain(30, 0) })
+    const column = buildBeam(sim, {
+      x0: 0,
+      y0: 0,
+      x1: 0,
+      y1: 4,
+      material: 'wood',
+      segments: 3,
+      pinStart: true,
+      clampStart: false,
+    })
+    const top = column.nodes[column.nodes.length - 1]!
+    sim.particles.invMass[top] = 1 / (sim.particles.massOf(top) + 5000)
+    const before = sim.distance.count
+
+    settle(sim, 15)
+
+    expect(sim.distance.count).toBe(before)
+    // And with margin: holding is not "barely not breaking".
+    expect(peakMemberLoad(sim) / MATERIALS.wood.breakStrain).toBeLessThan(0.6)
+  })
+
+  it('the same column snaps under fifty tonnes', () => {
+    // 50 t is 490 kN against 420 kN of capacity. Strength must still mean
+    // something - mutation check: x10 axialStrengthN makes this go red.
+    const sim = makeWorld({ widthM: 30, spacing: 0.5, terrain: flatTerrain(30, 0) })
+    const column = buildBeam(sim, {
+      x0: 0,
+      y0: 0,
+      x1: 0,
+      y1: 4,
+      material: 'wood',
+      segments: 3,
+      pinStart: true,
+      clampStart: false,
+    })
+    const top = column.nodes[column.nodes.length - 1]!
+    sim.particles.invMass[top] = 1 / (sim.particles.massOf(top) + 50000)
+    const before = sim.distance.count
+    settle(sim, 15)
+    expect(sim.distance.count).toBeLessThan(before)
+  })
+})
+
+describe('self-weight sag', () => {
+  /**
+   * A horizontal brace between two anchors, built through the SESSION - the
+   * production path, welds and joint masses included - hanging over deep
+   * ground. The measured sim tracks Euler-Bernoulli pin-pin within ~10%, so
+   * these bars are really about the MATERIAL constants reading right on
+   * screen. Method: red-first - before the I-section EI correction, steel
+   * sagged 3.6 cm here (over the 2 cm bar) and sagged MORE than wood.
+   */
+  const braceSag = (material: 'wood' | 'steel', L: number) => {
+    const field = new Field(120)
+    const sim = makeWorld({ widthM: 120, spacing: 0.25, terrain: flatTerrain(120, -30) })
+    const session = new Session(defaultLevel(field.widthM), sim, field)
+    const a = session.addAnchor(-L / 2, 0)
+    const b = session.addAnchor(L / 2, 0)
+    session.addMember(a, b, material)
+    for (let f = 0; f < 60 * 15; f++) sim.step(1 / 60)
+    const p = sim.particles
+    let minY = Infinity
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_NODE) continue
+      minY = Math.min(minY, p.posY[i]!)
+    }
+    return -minY
+  }
+
+  it('a 12 m steel cross-brace reads dead straight', () => {
+    // Structural steel is I-section: rigidity out of proportion to a solid
+    // bar. 5 mm measured; 2 cm allowed; the pre-fix 3.6 cm was a visible
+    // droop that made steel read as rubber.
+    expect(braceSag('steel', 12)).toBeLessThan(0.02)
+  })
+
+  it('steel sags less than wood at equal span, despite weighing 3.4x more', () => {
+    // The player-intuition invariant. Pre-fix it was backwards: steel EI was
+    // barely above wood's while its weight was triple, so the "strong"
+    // material drooped twice as far.
+    expect(braceSag('steel', 12)).toBeLessThan(braceSag('wood', 12))
+  })
+
+  it('wood keeps its deliberate visible bend', () => {
+    // The palm-tree feel is a design pillar, not an accident - a 12 m wood
+    // span should bow perceptibly (about 2 cm measured) without drooping
+    // like rope. Guards both directions.
+    const sag = braceSag('wood', 12)
+    expect(sag).toBeGreaterThan(0.008)
+    expect(sag).toBeLessThan(0.06)
   })
 })
 

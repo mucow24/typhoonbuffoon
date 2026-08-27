@@ -3,12 +3,19 @@ import { KIND_FLUID, type ParticleStore } from './particles'
 /**
  * A coarse column height field sampled from the fluid particles each frame.
  *
- * Buoyancy could be left to emerge from particle pressure, but that needs the
- * structure sampled as boundary particles contributing to fluid density, and it
- * makes lift depend on resolution - a member would float differently at
- * different settings of a slider the player controls. A height field gives
- * stable, resolution-independent lift, and the particles still do the shoving
- * and the containment through direct collision.
+ * This is the MEMBER regime's water model: member buoyancy, hydrostatic wall
+ * load, quadratic drag and wind shielding all read it, and all inherit its
+ * resolution-independence - a member must not float or load differently at
+ * different settings of a slider the player controls. Objects are the other
+ * regime: they live in the particle pressure field directly (see fluid.ts),
+ * which costs some resolution sensitivity in exchange for water genuinely
+ * displacing around them. The particles still do the shoving and the
+ * containment for both, through direct collision.
+ *
+ * Known limit shared by everything built on columns: one column holds one
+ * surface, so a sealed vessel with different levels inside and outside at the
+ * same x cannot be represented. The dome archetype is deferred partly for
+ * this reason.
  */
 export class WaterField {
   /** Column width in metres. */

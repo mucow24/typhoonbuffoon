@@ -1,5 +1,4 @@
 import { GameLoop } from './core/loop'
-import { Rng } from './core/rng'
 import { EditorController, type ToolName } from './editor/tools'
 import {
   Conditions,
@@ -9,7 +8,7 @@ import {
 } from './game/conditions'
 import { Session } from './game/session'
 import { CameraController } from './input/cameraController'
-import { defaultLevel, migrateLevel, migrateSolution } from './model/level'
+import { allIds, claimIds, defaultLevel, migrateLevel, migrateSolution } from './model/level'
 import { createRenderer, type Renderer } from './render/app'
 import { Camera } from './render/camera'
 import { EditorView } from './render/editorView'
@@ -31,7 +30,6 @@ export class Game {
   readonly renderer: Renderer
   readonly loop: GameLoop
   readonly hud: DebugOverlay
-  readonly rng: Rng
   readonly camera: Camera
   readonly field: Field
   readonly scenery: Scenery
@@ -53,7 +51,6 @@ export class Game {
 
   private constructor(renderer: Renderer) {
     this.renderer = renderer
-    this.rng = new Rng(0xf100d)
     this.camera = new Camera()
     this.field = new Field(120)
     this.scenery = new Scenery(renderer.world, renderer.background, this.field)
@@ -118,7 +115,12 @@ export class Game {
     this.hud
       .add('frame', () => `${this.loop.stats.smoothedFrameMs.toFixed(1)} ms`)
       .add('fps', () => `${(1000 / Math.max(this.loop.stats.smoothedFrameMs, 0.001)).toFixed(0)}`)
-      .add('state', () => (this.paused ? 'PAUSED' : 'running'))
+      .add('state', () => {
+        if (this.paused) return 'PAUSED'
+        // The loop drops sim time rather than spiralling when a step costs
+        // more than the frame budget; say so, or heavy scenes read as broken.
+        return this.loop.stats.starved ? 'running (slow-mo)' : 'running'
+      })
       .add('substeps', () => String(this.sim.substeps))
       .add('field', () => `${this.field.widthM.toFixed(0)} m`)
       .add('particles', () => String(this.sim.particles.count))
@@ -166,9 +168,20 @@ export class Game {
     let peak = 0
     for (let i = 0; i < d.highWater; i++) {
       if (d.slots.alive[i] !== 1) continue
+      if (d.unbreakable[i] === 1) continue // joinery: welds, mount links
       const m = materialAt(d.material[i]!)
       if (m.breakStrain <= 0) continue
       peak = Math.max(peak, Math.abs(d.strain[i]!) / m.breakStrain)
+    }
+    // Bending is a failure mode too - a wall carrying hydrostatic load shows
+    // almost no axial strain, and the HUD reading 0% on a wall about to snap
+    // is the legibility failure the genre cannot afford.
+    const b = this.sim.bend
+    for (let i = 0; i < b.highWater; i++) {
+      if (b.slots.alive[i] !== 1) continue
+      const m = materialAt(b.material[i]!)
+      if (!(m.breakAngle > 0) || !Number.isFinite(m.breakAngle)) continue
+      peak = Math.max(peak, Math.abs(b.angle[i]!) / m.breakAngle)
     }
     return peak
   }
@@ -334,7 +347,10 @@ export class Game {
       value: this.sim.fluid.spacing,
       format: (v) => `${v.toFixed(2)} m`,
       onInput: (v) => {
-        this.sim.fluid.spacing = v
+        // Restamps live water to the new mass/radius - setting fluid.spacing
+        // directly left existing particles at the old mass under a solver
+        // that assumes one uniform mass.
+        this.sim.setFluidSpacing(v)
       },
     })
 
@@ -453,6 +469,9 @@ export class Game {
         const parsed = JSON.parse(await file.text()) as { level?: unknown; solution?: unknown }
         this.session.doc = migrateLevel(parsed.level)
         this.session.solution = migrateSolution(parsed.solution)
+        // The id counter restarts at zero each page load; without claiming
+        // the loaded ids, the next placed anchor collides with a saved one.
+        claimIds(allIds(this.session.doc, this.session.solution))
         this.field.setWidth(this.session.doc.widthM)
         this.session.rebuild()
         this.fitView()
@@ -485,6 +504,10 @@ export class Game {
     if (this.paused) return
     this.conditions.update(dt)
     this.sim.step(dt)
+    // Every frame, before any tool can act on member records: breakage frees
+    // constraint slots, and the session must forget those indices before the
+    // free list recycles them into someone else's constraints.
+    this.session.syncBreaks()
     if (this.sim.breakEvents.length > 0) {
       this.breakCount += this.sim.breakEvents.length
       this.sim.breakEvents.length = 0
