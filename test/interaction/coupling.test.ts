@@ -270,10 +270,12 @@ describe('containment', () => {
     })
     // And the absolute magnitude is a structural event: 6 m of water on an
     // 8 m wood wall loads it to over half of failure (measured 0.59; the
-    // hand-calculated hydrostatic root-joint figure alone is ~0.3). The bound
-    // sits at 0.45 deliberately - capsule contacts alone measure 0.39, so
-    // this line is what fails if the analytic hydrostatic term is dropped
-    // (mutation-verified red with applyHydrostaticLoad disabled).
+    // hand-calculated hydrostatic root-joint figure alone is ~0.3 - the ~2x
+    // stacking of contacts + analytic term is deliberate tuning, documented
+    // in applyHydrostaticLoad). The bound sits at 0.45 deliberately -
+    // capsule contacts alone measure 0.39, so this line is what fails if the
+    // analytic hydrostatic term is dropped (mutation-verified red with
+    // applyHydrostaticLoad disabled).
     expect(d6.load).toBeGreaterThan(0.45)
     // The wall visibly leans away from the water (water is on the left, so
     // the tip moves right).

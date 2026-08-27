@@ -232,6 +232,11 @@ stays consistent when the substep count changes. That property is the reason for
 hand-rolled springs: stiff steel doesn't explode, and retuning substeps doesn't retune the
 whole game.
 
+> **Superseded (Aug 2026):** the shipped solve order differs from the sketch above:
+> clusters solve FIRST, then bending, then distance, then the fluid projection, then
+> contacts — the Gauss-Seidel ordering rationale (the last solve wins locally) lives as
+> comments in `SimWorld.step` in `src/sim/world.ts`, which is authoritative.
+
 **Stress** is `strain = (liveLength - restLength) / restLength`, available for free. It drives
 the colour ramp, the damage accumulation, and the break test. One number, three jobs.
 
@@ -312,6 +317,18 @@ stay rigid.
 
 **Anchors bind to an object's frame, not to an individual particle** — a point in object-local
 space transformed by the cluster's current position and orientation.
+
+> **Superseded in part (Aug 2026):** object buoyancy does NOT emerge purely from the
+> per-particle pressure field as argued above. Measured: PBF's per-substep lambda carries no
+> depth gradient in the bulk, so pressure-derived lift is surface-only — a wood crate
+> released 5 m down hovered indefinitely. The shipped design is analytic rest-volume
+> buoyancy gated by a per-particle fluid-neighbour wetness census, plus pairwise hull
+> viscosity for drag; the pressure field still handles displacement, waves, and slams. A
+> consequence the "water inside a cracked dome" argument above did not anticipate: the
+> one-column height field cannot represent different water levels inside and outside a
+> sealed vessel, so the dome archetype needs its own pressure model when it lands. Object
+> anchors are frame mounts (a dedicated node with triangulated links to the nearest cluster
+> particles). Rationale and measurements live in `src/sim/fluid.ts` and `src/sim/world.ts`.
 
 Objects spawn and despawn at runtime, which is the same solver requirement already established
 in §5.2.

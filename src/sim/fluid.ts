@@ -55,14 +55,17 @@ export class FluidSolver {
    * Pressure multiplier on the fluid's lambda against DYNAMIC solids; static
    * boundary always gets the single (1x) form.
    *
-   * Both extremes measured on probes: full Akinci mirroring (2x) at the
-   * static bed pumped 38% transient energy growth (vs 10% at 1x) - the
-   * doubled response against a lambda whose denominator assumed unit response
-   * resonates the bottom layer - so the bed stays at 1x unconditionally.
-   * At a hull, 1x halves interface stiffness and compressed water escapes
-   * sideways around a floating box instead of lifting it (a box under 2.5 m
-   * of added flood sat at the bottom indefinitely), while 2x over-lifts the
-   * same box a third of its height. This dial sets the hull between them.
+   * This dial is about hull INTERFACE stiffness only - how firmly water
+   * displaces around a moving hull - not about lift. Object buoyancy is the
+   * analytic rest-volume term in SimWorld.applyBuoyancy (wetness-gated);
+   * while lift still came from this pressure path, the dial mattered
+   * enormously (at 1x a box buried under added flood water sat at the bottom
+   * indefinitely; at 2x it over-lifted by a third of its height), which is
+   * why the flag exists. With analytic buoyancy carrying lift, 1x suffices
+   * and matches the bed convention. Raising it firms up displacement around
+   * fast hulls at the cost of livelier interface jitter; the static bed
+   * stays at 1x unconditionally either way (2x there resonated the bottom
+   * layer - measured 38% transient energy growth vs 10%).
    */
   hullPressureFactor = 1
   /**

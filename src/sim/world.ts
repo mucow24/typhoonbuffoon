@@ -513,20 +513,26 @@ export class SimWorld {
   /**
    * Static water pressure on members, from the column height field.
    *
-   * Positional capsule contacts transmit the *dynamic* exchange - impacts,
-   * currents shoving - but at rest the water stands off the capsule and the
-   * per-substep penetration flux is tiny, so contacts alone deliver a few
-   * percent of the true hydrostatic load. The static load is computed the way
-   * the rest of the member regime computes water effects: from the height
-   * field, resolution-independent by construction.
+   * HONEST ACCOUNTING - this term deliberately STACKS on top of the two-way
+   * capsule contacts, and the combined static wall load runs about 2x the
+   * physical figure. Measured on the calibration wall (6 m head, 8 m wood
+   * wall): contacts alone deliver ~0.39 load fraction - already ~130% of the
+   * hand-calculated 1/2 rho g H^2 root-joint figure of ~0.3 - and this term
+   * brings the sum to ~0.59. That total is game tuning, not physics: walls
+   * under siege must read dramatic, and the material strength constants are
+   * calibrated against the COMBINED number (the wall tests pin it; anyone
+   * retuning one half must re-measure the sum). What this term adds that
+   * contacts cannot: a smooth static component that is resolution-
+   * independent by construction, where contact flux scales with the particle
+   * arrangement. An earlier comment here claimed contacts alone deliver
+   * "a few percent" - that was measured before the endpoint reactions
+   * existed and is false for the shipped two-way contacts.
    *
    * Per member: sample the water surface a little to each side, take the
    * pressure difference at the member's depth, and load its VERTICAL extent
    * with the net horizontal force. Only the horizontal component is applied -
    * the vertical pressure difference across a member IS buoyancy, which
-   * applyBuoyancy already provides from rest volume. Integrated over a wall
-   * this reproduces the 1/2 rho g H^2 resultant, which is the load the whole
-   * flood-wall archetype is about.
+   * applyBuoyancy already provides from rest volume.
    *
    * Known limit: a sealed vessel (water inside a dome vs outside) shares one
    * column, so interior/exterior pressure cannot differ at the same x. The
@@ -542,6 +548,10 @@ export class SimWorld {
 
     for (let m = 0; m < d.highWater; m++) {
       if (alive[m] !== 1) continue
+      // Joinery carries no wall area - see the same guard in applyWaterDrag.
+      // Mount links (rest > 0) slipped past the rest check and were taking
+      // wood-material hydrostatic wall load inside the object they join.
+      if (d.unbreakable[m] === 1) continue
       const rest = d.rest[m]!
       if (rest <= 1e-6) continue
       const ia = d.a[m]!
@@ -589,8 +599,13 @@ export class SimWorld {
 
     for (let m = 0; m < d.highWater; m++) {
       if (alive[m] !== 1) continue
+      // Joinery is not structure: welds and mount links have no physical
+      // cross-section, but they DO carry a material index (defaulting to
+      // wood), and without this guard every one of them caught wood-section
+      // drag - phantom forces concentrated exactly at the connections.
+      if (d.unbreakable[m] === 1) continue
       const rest = d.rest[m]!
-      if (rest <= 1e-6) continue // welds have no frontal area
+      if (rest <= 1e-6) continue // degenerate segments have no frontal area
       const ia = d.a[m]!
       const ib = d.b[m]!
       const wa = p.invMass[ia]!
@@ -795,6 +810,12 @@ export class SimWorld {
 
     for (let m = 0; m < d.highWater; m++) {
       if (alive[m] !== 1) continue
+      // Joinery catches no wind. This pass had NO guard at all: every
+      // zero-rest weld read `frontal = 0 + mat.section` of WOOD (joinery
+      // defaults to material 0), which at 250 kph was ~1.1 kN of phantom
+      // load per weld, two per member, delivered exactly at the joints - on
+      // steel structures, as wood.
+      if (d.unbreakable[m] === 1) continue
       const ia = d.a[m]!
       const ib = d.b[m]!
       const wa = p.invMass[ia]!
@@ -1225,9 +1246,9 @@ export class SimWorld {
   }
 
   /**
-   * A joint snapping in bending severs the member there: the bend goes, and so
-   * does the weaker of the two distance segments meeting at the joint -
-   * a fracture is a break in the material, not just a freed hinge.
+   * A joint snapping in bending severs the member there: the bend goes, and
+   * so does the MOST-STRAINED of the two distance segments meeting at the
+   * joint - a fracture is a break in the material, not just a freed hinge.
    */
   private breakBend(i: number, angle: number): void {
     const b = this.bend

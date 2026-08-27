@@ -90,14 +90,12 @@ export class Conditions {
   private maintainFlood(): void {
     const target = this.targetParticleCount()
     const current = this.sim.fluidCount
-    const spacing = this.sim.fluid.spacing
 
     if (current < target) {
       this.admitFromEdges(Math.min(this.inflowRate, target - current))
     } else if (current > target + this.inflowRate * 2) {
       this.drain(Math.min(this.inflowRate, current - target))
     }
-    void spacing
   }
 
   /**

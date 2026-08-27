@@ -3,6 +3,7 @@ import { buildBeam } from '../../src/scenes/demos'
 import { Field } from '../../src/world/field'
 import { Session } from '../../src/game/session'
 import { defaultLevel } from '../../src/model/level'
+import { KIND_NODE } from '../../src/sim/particles'
 import { MATERIALS } from '../../src/sim/materials'
 import {
   analyticCantileverTip,
@@ -302,7 +303,7 @@ describe('self-weight sag', () => {
     const p = sim.particles
     let minY = Infinity
     for (let i = 0; i < p.highWater; i++) {
-      if (p.slots.alive[i] !== 1 || p.kind[i] !== 0) continue
+      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_NODE) continue
       minY = Math.min(minY, p.posY[i]!)
     }
     return -minY
