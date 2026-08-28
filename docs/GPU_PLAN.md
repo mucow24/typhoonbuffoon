@@ -44,11 +44,11 @@ What shipped matches this plan with three notable learnings:
   speed, hidden ones slow-mo gracefully under the stepper's drop-debt
   contract.
 
-Deferred, deliberately: readback pipelining (above); GPU-direct rendering
-(Pixi stays on WebGL reading snapshots); a member-segment grid for capsule
-contacts if member counts ever reach the thousands (the whole-structure
-AABB early-out covers current content); the spawnDisc jitter-order fix
-(pre-existing, tracked separately).
+Deferred, deliberately: GPU-direct rendering (Pixi stays on WebGL reading
+snapshots); a member-segment grid for capsule contacts if member counts
+ever reach the thousands (the whole-structure AABB early-out covers current
+content); the spawnDisc jitter-order fix (pre-existing, tracked
+separately).
 
 ## Where the time goes today (measured, 2026-08-28, i9-14900HX)
 
