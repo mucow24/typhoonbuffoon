@@ -103,6 +103,13 @@ export interface SnapshotScalars {
   widthM: number
   /** Smoothed wall-clock cost of one sim step, ms. */
   stepMs: number
+  /**
+   * Achieved sim rate, steps per wall second, smoothed - 60 means real time,
+   * lower means the drop-debt slow-mo contract is active. Zero while paused.
+   * This is the number that answers "the HUD says slow-mo but fps reads
+   * 140": render rate and sim rate are different clocks.
+   */
+  simFps: number
   /** Active solver backend: 'webgpu', 'cpu', or 'cpu (no webgpu)'. */
   backend: string
 }

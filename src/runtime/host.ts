@@ -44,6 +44,9 @@ export class SimHost {
   private paused = true
   private breakCount = 0
   private stepMs = 0
+  private simFps = 0
+  private rateLastNow = 0
+  private rateLastSteps = 0
   private backendName = 'cpu'
   /**
    * Commands queue and drain only at frame boundaries: the GPU backend's
@@ -125,12 +128,31 @@ export class SimHost {
   async tick(now: number): Promise<void> {
     if (this.ticking) return
     this.ticking = true
+    this.tickNow = now
     try {
       await this.drainCommands()
       await this.stepper.advanceAsync(now)
     } finally {
       this.ticking = false
     }
+  }
+
+  private tickNow = 0
+
+  /** Achieved sim steps per wall second, smoothed - the slow-mo readout. */
+  private trackSimRate(now: number): void {
+    if (this.paused) {
+      this.simFps = 0
+      this.rateLastNow = 0
+      return
+    }
+    const steps = this.stepper.stats.totalSteps
+    if (this.rateLastNow > 0 && now > this.rateLastNow) {
+      const inst = ((steps - this.rateLastSteps) * 1000) / (now - this.rateLastNow)
+      this.simFps = this.simFps === 0 ? inst : this.simFps * 0.9 + inst * 0.1
+    }
+    this.rateLastNow = now
+    this.rateLastSteps = steps
   }
 
   private async drainCommands(): Promise<void> {
@@ -173,6 +195,9 @@ export class SimHost {
   }
 
   private frameEnd(): void {
+    // Rate first, so the snapshot leaving this frame carries THIS frame's
+    // achieved sim rate (and 0 the instant a pause lands, not a frame late).
+    this.trackSimRate(this.tickNow)
     if ((!this.paused && this.stepper.stats.stepsLastFrame > 0) || this.dirty) {
       this.emitSnapshot()
       this.dirty = false
@@ -462,6 +487,7 @@ export class SimHost {
       budget: this.session.doc.budget,
       widthM: this.field.widthM,
       stepMs: this.stepMs,
+      simFps: this.simFps,
       backend: this.backendName,
     }
   }

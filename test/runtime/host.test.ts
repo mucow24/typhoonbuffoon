@@ -347,6 +347,26 @@ describe('SimHost', () => {
     expect(fluidStats(last()).count).toBeGreaterThan(fluidBefore)
   })
 
+  it('reports the achieved sim rate: ~60 when healthy, 0 while paused', async () => {
+    const { host, frame, last } = makeHost()
+    await frame()
+    expect(last().scalars.simFps).toBe(0) // paused
+
+    host.enqueue({ type: 'togglePause' })
+    // Enough frames for the smoothing to converge: per-tick step counts
+    // oscillate 0/1/2 at float boundaries of the accumulator, so instant
+    // samples swing while the mean is 60.
+    for (let i = 0; i < 30; i++) await frame()
+    const running = last().scalars.simFps
+    expect(running).toBeGreaterThan(35)
+    expect(running).toBeLessThan(85)
+
+    host.enqueue({ type: 'togglePause' })
+    await frame()
+    await frame()
+    expect(last().scalars.simFps).toBe(0)
+  })
+
   it('reset restores the play snapshot and pauses', async () => {
     const { host, frame, last } = makeHost()
     host.enqueue({

@@ -116,16 +116,25 @@ export class Game {
 
     const s = () => this.client.latest?.scalars ?? null
     this.hud
-      .add('frame', () => `${this.smoothedFrameMs.toFixed(1)} ms`)
-      .add('fps', () => `${(1000 / Math.max(this.smoothedFrameMs, 0.001)).toFixed(0)}`)
+      .add('render', () => `${(1000 / Math.max(this.smoothedFrameMs, 0.001)).toFixed(0)} fps`)
+      .add('sim rate', () => {
+        const sc = s()
+        if (!sc || sc.paused) return '—'
+        // Render fps and sim rate are DIFFERENT clocks: 140 fps rendering of
+        // a 35 Hz sim is smooth slow motion, not a healthy sim.
+        return `${sc.simFps.toFixed(0)} / 60 Hz`
+      })
       .add('sim step', () => `${(s()?.stepMs ?? 0).toFixed(1)} ms`)
       .add('backend', () => s()?.backend ?? 'starting')
       .add('state', () => {
         const sc = s()
         if (!sc || sc.paused) return 'PAUSED'
         // The worker drops sim time rather than spiralling when a step costs
-        // more than the frame budget; say so, or heavy scenes read as broken.
-        return sc.starved ? 'running (slow-mo)' : 'running'
+        // more than the frame budget; say by how much, or heavy scenes read
+        // as broken instead of as slow motion.
+        if (!sc.starved) return 'running'
+        const factor = Math.min(sc.simFps / 60, 1)
+        return `running (slow-mo ${factor.toFixed(2)}x)`
       })
       .add('substeps', () => String(s()?.substeps ?? DEFAULTS.substeps))
       .add('field', () => `${(s()?.widthM ?? this.field.widthM).toFixed(0)} m`)

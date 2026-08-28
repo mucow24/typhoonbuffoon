@@ -60,7 +60,12 @@ export class GpuSolver implements SolverBackend {
     try {
       const gpu = (globalThis.navigator as Navigator | undefined)?.gpu
       if (!gpu) return null
-      const adapter = await gpu.requestAdapter()
+      // Ask for the DISCRETE GPU explicitly: on dual-GPU laptops the default
+      // adapter is frequently the power-saver iGPU, which turns a 4090
+      // machine into a gen-12lp machine and the flood into slow motion.
+      const adapter =
+        (await gpu.requestAdapter({ powerPreference: 'high-performance' })) ??
+        (await gpu.requestAdapter())
       if (!adapter) return null
       const device = await adapter.requestDevice()
       return new GpuSolver(w, device)
