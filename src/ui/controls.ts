@@ -3,6 +3,9 @@
  * sliders and a readout; a framework would be friction here (docs/PLAN.md 5.1).
  */
 
+import { snapToDetent } from '../core/math'
+import { THUMB_PX, TRACK_PX, atFraction, fillOrigin, fillRange, fraction } from './sliderGeometry'
+
 const uiRoot = (): HTMLElement => {
   const el = document.getElementById('ui')
   if (!el) throw new Error('#ui root missing from index.html')
@@ -142,12 +145,118 @@ function labelledRow(parent: HTMLElement, label: string): { row: HTMLDivElement;
   return { row, value }
 }
 
+/**
+ * The kit draws its own slider track.
+ *
+ * A native range fills from `min` to the thumb, which is wrong for anything
+ * signed: at dead calm the wind slider read half full, as though the storm
+ * were half on. Neither `accent-color` nor any other property moves that
+ * origin, and the fill lives in a shadow pseudo-element, so the only way to
+ * put it where it belongs is to paint the track ourselves - which also makes
+ * the thumb size a number we KNOW rather than one we assume, so the tick
+ * marks and the fill can be placed against it exactly.
+ *
+ * Injected once, lazily: the kit is otherwise inline-styled, and
+ * pseudo-elements cannot be.
+ */
+let sliderCssInjected = false
+function ensureSliderCss(): void {
+  if (sliderCssInjected) return
+  sliderCssInjected = true
+  const el = document.createElement('style')
+  el.textContent = `
+.tb-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: ${THUMB_PX}px;
+  margin: 2px 0 0;
+  background: transparent;
+  cursor: pointer;
+  --tb-groove: rgba(255, 255, 255, 0.14);
+  --tb-fill: var(--tb-groove);
+}
+.tb-slider::-webkit-slider-runnable-track {
+  height: ${TRACK_PX}px;
+  border-radius: ${TRACK_PX / 2}px;
+  background: var(--tb-fill);
+}
+.tb-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: ${THUMB_PX}px;
+  height: ${THUMB_PX}px;
+  /* Centre the thumb on the track rather than on the track's top edge. */
+  margin-top: ${(TRACK_PX - THUMB_PX) / 2}px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  background: var(--accent);
+}
+.tb-slider::-moz-range-track {
+  height: ${TRACK_PX}px;
+  border-radius: ${TRACK_PX / 2}px;
+  background: var(--tb-fill);
+}
+/* Firefox paints its own left-origin progress bar over the track. Not here. */
+.tb-slider::-moz-range-progress { height: ${TRACK_PX}px; background: transparent; }
+.tb-slider::-moz-range-thumb {
+  box-sizing: border-box;
+  width: ${THUMB_PX}px;
+  height: ${THUMB_PX}px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  background: var(--accent);
+}
+.tb-slider:hover::-webkit-slider-thumb { filter: brightness(1.15); }
+.tb-slider:hover::-moz-range-thumb { filter: brightness(1.15); }
+.tb-slider:focus { outline: none; }
+.tb-slider:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px rgba(111, 211, 255, 0.3); }
+.tb-slider:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 3px rgba(111, 211, 255, 0.3); }
+`
+  document.head.appendChild(el)
+}
+
+/**
+ * The cosmetic tick row under a slider. Marks only: a tick you can feel is a
+ * detent, and a slider that snapped to every 50 kph could not be set to 175.
+ */
+function tickStrip(opts: SliderOptions, detents: readonly number[]): HTMLDivElement {
+  const strip = document.createElement('div')
+  style(strip, { position: 'relative', height: '5px', margin: '-1px 0 2px' })
+
+  for (const t of opts.ticks ?? []) {
+    const detent = detents.includes(t)
+    const mark = document.createElement('div')
+    style(mark, {
+      position: 'absolute',
+      top: '0',
+      left: atFraction(fraction(t, opts.min, opts.max)),
+      transform: 'translateX(-50%)',
+      width: '1px',
+      height: detent ? '5px' : '3px',
+      background: detent ? 'var(--accent)' : 'var(--text-dim)',
+      opacity: detent ? '0.85' : '0.45',
+    })
+    strip.appendChild(mark)
+  }
+  return strip
+}
+
 export interface SliderOptions {
   label: string
   min: number
   max: number
   step?: number
   value: number
+  /** Values to draw a mark at. Purely a scale - they do not snap. */
+  ticks?: number[]
+  /** Values the thumb sticks to while it is being dragged. */
+  detents?: number[]
+  /** Detent catchment in value units. Defaults to two steps. */
+  detentRadius?: number
+  /** Where the filled part of the bar grows from. Defaults to zero. */
+  origin?: number
   format?: (v: number) => string
   onInput: (v: number) => void
 }
@@ -156,28 +265,80 @@ export class Slider {
   readonly input: HTMLInputElement
   private readonly valueEl: HTMLSpanElement
   private readonly format: (v: number) => string
+  private readonly min: number
+  private readonly max: number
+  private readonly origin: number
+  /** Detents apply to the pointer only - see the listener below. */
+  private dragging = false
 
   constructor(parent: HTMLElement, opts: SliderOptions) {
+    ensureSliderCss()
     const { row, value } = labelledRow(parent, opts.label)
     this.valueEl = value
     this.format = opts.format ?? ((v) => v.toFixed(2))
+    this.min = opts.min
+    this.max = opts.max
+    this.origin = opts.origin ?? fillOrigin(opts.min, opts.max)
+
+    const step = opts.step ?? (opts.max - opts.min) / 100
+    const detents = opts.detents ?? []
+    const detentRadius = opts.detentRadius ?? step * 2
 
     this.input = document.createElement('input')
     this.input.type = 'range'
+    this.input.className = 'tb-slider'
     this.input.min = String(opts.min)
     this.input.max = String(opts.max)
-    this.input.step = String(opts.step ?? (opts.max - opts.min) / 100)
+    this.input.step = String(step)
     this.input.value = String(opts.value)
-    style(this.input, { width: '100%', accentColor: 'var(--accent)', margin: '2px 0 0' })
+
+    if (detents.length > 0) {
+      this.input.addEventListener('pointerdown', () => {
+        this.dragging = true
+      })
+      // The pointer is usually released off the input - a range drag wanders
+      // far from a 200px control - so the release has to be watched globally.
+      const release = () => {
+        this.dragging = false
+      }
+      window.addEventListener('pointerup', release)
+      window.addEventListener('pointercancel', release)
+    }
 
     this.input.addEventListener('input', () => {
-      const v = Number(this.input.value)
+      let v = Number(this.input.value)
+      // Pointer only. Arrow keys step by exactly one step, and a detent wider
+      // than a step would swallow the keypress and trap the slider on zero.
+      if (this.dragging) {
+        const snapped = snapToDetent(v, detents, detentRadius)
+        if (snapped !== v) {
+          v = snapped
+          this.input.value = String(v)
+        }
+      }
       this.valueEl.textContent = this.format(v)
+      this.paint()
       opts.onInput(v)
     })
 
     row.appendChild(this.input)
+    if (opts.ticks && opts.ticks.length > 0) row.appendChild(tickStrip(opts, detents))
     this.valueEl.textContent = this.format(opts.value)
+    this.paint()
+  }
+
+  /**
+   * Repaint the track. The fill runs between the origin and the thumb CENTRE,
+   * so it ends under the thumb rather than short of it or past it.
+   */
+  private paint(): void {
+    const [lo, hi] = fillRange(Number(this.input.value), this.origin, this.min, this.max)
+    const a = atFraction(lo)
+    const b = atFraction(hi)
+    this.input.style.setProperty(
+      '--tb-fill',
+      `linear-gradient(to right, var(--tb-groove) 0 ${a}, var(--accent) ${a} ${b}, var(--tb-groove) ${b} 100%)`,
+    )
   }
 
   get value(): number {
@@ -187,6 +348,7 @@ export class Slider {
   set(v: number, fire = false): void {
     this.input.value = String(v)
     this.valueEl.textContent = this.format(v)
+    this.paint()
     if (fire) this.input.dispatchEvent(new Event('input'))
   }
 }

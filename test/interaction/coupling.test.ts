@@ -414,10 +414,16 @@ describe('wind on structures', () => {
     expectNear(b / Math.max(a, 1e-6), 4, { rel: 0.75, label: 'deflection ratio for 2x wind' })
   })
 
-  it('bends the mast downwind, not upwind', () => {
-    // The wind field blows in -x by default.
-    const { deflection } = deflectionAt(150)
-    expect(deflection).toBeLessThan(0)
+  it('bends the mast downwind, whichever way downwind is', () => {
+    // The slider is signed: +kph blows in +x, -kph in -x. A mast that leans
+    // the same way for both signs means the sign never reached the solver.
+    const right = deflectionAt(150).deflection
+    const left = deflectionAt(-150).deflection
+
+    expect(right).toBeGreaterThan(0)
+    expect(left).toBeLessThan(0)
+    // Same storm, mirrored: the two leans should be comparable in size.
+    expectNear(Math.abs(left), Math.abs(right), { rel: 0.3, label: 'mirrored mast deflection' })
   })
 
   it('sways smoothly rather than buzzing', () => {

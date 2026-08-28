@@ -22,7 +22,10 @@ export const WAVE_LEVELS: Record<WaveStrength, number> = {
  * system. Authored storm timelines are deferred; this is the whole driver.
  */
 export class Conditions {
-  /** 0-250 kph. 250 is roughly a category 5. */
+  /**
+   * -250..250 kph. 250 is roughly a category 5; the SIGN is the heading, with
+   * positive blowing in +x (to the right) so the slider reads like the world.
+   */
   windKph = 0
   /**
    * Target water level in metres. Water rolls in from the field edges.
@@ -57,7 +60,8 @@ export class Conditions {
 
   /** 0..1 overall severity, used to grey the sky. */
   severity(): number {
-    const wind = this.windKph / WIND_MAX_KPH
+    // Magnitude only: a storm out of the east is not a calmer storm.
+    const wind = Math.abs(this.windKph) / WIND_MAX_KPH
     const flood = this.floodLevelM / FLOOD_MAX_M
     const wave = WAVE_LEVELS[this.waveStrength]
     return clamp(wind * 0.5 + flood * 0.3 + wave * 0.2, 0, 1)
@@ -82,7 +86,12 @@ export class Conditions {
   }
 
   update(dt: number): void {
-    this.sim.wind.baseSpeed = kphToMs(this.windKph)
+    // Speed and heading are separate in the wind field, and both velocityAt()
+    // and applyWind() bail on `baseSpeed <= 0`. A signed kph handed straight
+    // to baseSpeed is not a wind blowing the other way, it is no wind at all -
+    // so split the sign off here rather than teaching the solver about it.
+    this.sim.wind.baseSpeed = kphToMs(Math.abs(this.windKph))
+    this.sim.wind.direction = this.windKph < 0 ? -1 : 1
     this.maintainFlood()
     this.driveWaves(dt)
   }

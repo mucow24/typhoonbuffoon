@@ -49,3 +49,27 @@ export const kphToMs = (kph: number): number => kph * (1000 / 3600)
 
 /** m/s -> km/h */
 export const msToKph = (ms: number): number => ms * (3600 / 1000)
+
+/**
+ * Magnetic pull toward a detent value.
+ *
+ * A control that must be able to return to EXACTLY one value - zero on a
+ * signed range - cannot ask the user to land on a single pixel. Anything
+ * within `radius` of a detent reads as that detent; everything else is left
+ * alone, so tick marks stay decorative and the values between them stay
+ * reachable. Ties resolve to the first detent given, so the result does not
+ * depend on float noise.
+ */
+export function snapToDetent(v: number, detents: readonly number[], radius: number): number {
+  if (radius <= 0) return v
+  let best = v
+  let bestDist = Infinity
+  for (const d of detents) {
+    const dist = Math.abs(v - d)
+    if (dist <= radius && dist < bestDist) {
+      bestDist = dist
+      best = d
+    }
+  }
+  return best
+}
