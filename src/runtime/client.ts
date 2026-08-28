@@ -27,7 +27,10 @@ export class SimClient {
   previous: WorldSnapshot | null = null
 
   private requestCounter = 0
-  private readonly pending = new Map<number, (msg: HostMessage) => void>()
+  private readonly pending = new Map<
+    number,
+    { resolve: (msg: HostMessage) => void; reject: (err: Error) => void }
+  >()
   private readonly snapshotListeners = new Set<(snap: WorldSnapshot) => void>()
 
   constructor(
@@ -82,8 +85,8 @@ export class SimClient {
 
   private request(make: (requestId: number) => Command): Promise<HostMessage> {
     const requestId = ++this.requestCounter
-    return new Promise((resolve) => {
-      this.pending.set(requestId, resolve)
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject })
       this.port.postMessage(make(requestId))
     })
   }
@@ -117,11 +120,25 @@ export class SimClient {
       }
       case 'saveData':
       case 'ack': {
-        const resolve = this.pending.get(msg.requestId)
-        if (resolve) {
+        const req = this.pending.get(msg.requestId)
+        if (req) {
           this.pending.delete(msg.requestId)
-          resolve(msg)
+          req.resolve(msg)
         }
+        break
+      }
+      case 'nack': {
+        // A failed command: reject its promise if it had one, else surface
+        // the error where a developer will see it.
+        if (msg.requestId !== null) {
+          const req = this.pending.get(msg.requestId)
+          if (req) {
+            this.pending.delete(msg.requestId)
+            req.reject(new Error(msg.error))
+            break
+          }
+        }
+        console.error('sim worker rejected a command:', msg.error)
         break
       }
     }

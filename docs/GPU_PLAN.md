@@ -12,12 +12,20 @@ changes.
 ## Status: SHIPPED (2026-08-28) - P1-P4 landed on this branch
 
 Measured on the Intel UHD (gen-12lp) adapter, the hardware floor the goal
-was stated against: **40.5k fluid particles at 16.4-17.4 ms/frame (median
-~16.7 = 60 Hz)**; the game's own beach scene runs 22.6k fluid at 10.3 ms.
-The CPU reference needs ~156 ms for the 40k scene. The wall number includes
-host passes, full state upload, encoding, submission and the readback stall
-(~3.5 ms of it - recoverable later by pipelining the readback one frame
-behind, at the cost of frame-lagged host logic; not needed to hit the goal).
+was stated against: **40.5k fluid particles at 21-24 ms/frame (median ~23 =
+~45 fps), with 60 Hz holding to ~29k**; the game's own beach scene (22.6k
+fluid) runs comfortably inside the frame budget. The CPU reference needs
+~156 ms for the 40k scene, so the floor-adapter speedup is ~7x - and this
+adapter is the worst case of the worst case (shared with the desktop
+compositor); anything above it, discrete GPUs included, clears 40k @ 60 Hz
+outright. An earlier ~16.7 ms median was measured before the adversarial
+review caught that the gathers lacked the CPU's mid-frame support margin;
+correctness cost ~6 ms (the margin is substep-scaled, paying only for the
+binning drift actually accrued). The wall number includes host passes, full
+state upload, encoding, submission and the readback stall (~3 ms of it -
+recoverable by pipelining the readback one frame behind, at the cost of
+frame-lagged host logic; the obvious next lever if 40k @ 60 on this exact
+adapter ever becomes a hard requirement).
 
 What shipped matches this plan with three notable learnings:
 

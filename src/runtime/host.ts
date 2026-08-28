@@ -52,6 +52,9 @@ export class SimHost {
    */
   private readonly commandQueue: Command[] = []
   private ticking = false
+  /** Acks held until AFTER the snapshot reflecting their command has been
+   *  posted, so `await pump()` then reading client.latest sees the result. */
+  private pendingAcks: number[] = []
   /** Held-cursor position while the water tool streams, or null. */
   private stream: { x: number; y: number } | null = null
   private pendingEvents: BreakEventVM[] = []
@@ -133,7 +136,16 @@ export class SimHost {
   private async drainCommands(): Promise<void> {
     while (this.commandQueue.length > 0) {
       const cmd = this.commandQueue.shift()!
-      await this.applyCommand(cmd)
+      try {
+        await this.applyCommand(cmd)
+      } catch (err) {
+        // A failed command must never hang a client promise or kill the
+        // drain: nack it (with its request id when it has one) and keep
+        // going. The snapshot after this drain shows whatever state stands.
+        const requestId = 'requestId' in cmd ? cmd.requestId : null
+        this.post({ type: 'nack', requestId, error: String(err) })
+        this.dirty = true
+      }
     }
   }
 
@@ -165,6 +177,10 @@ export class SimHost {
       this.emitSnapshot()
       this.dirty = false
     }
+    if (this.pendingAcks.length > 0) {
+      for (const requestId of this.pendingAcks) this.post({ type: 'ack', requestId })
+      this.pendingAcks = []
+    }
   }
 
   // ---------------------------------------------------------------- commands
@@ -193,14 +209,20 @@ export class SimHost {
         break
       case 'pump': {
         for (let i = 0; i < cmd.steps; i++) await this.stepper.stepAsync()
-        this.post({ type: 'ack', requestId: cmd.requestId })
+        this.pendingAcks.push(cmd.requestId)
         break
       }
 
       // -- build edits
       case 'buildMember': {
-        const a = cmd.fromNode ?? this.session.addNode(cmd.fromX, cmd.fromY)
-        const b = cmd.toNode ?? this.session.addNode(cmd.toX, cmd.toY)
+        // Snapped ids come from the main thread's snapshot-time picks; a
+        // command queued ahead of this one (undo, delete) can have removed
+        // them. A stale id must fall back to the gesture coordinates - not
+        // mint a doc member whose endpoints do not exist.
+        const fromValid = cmd.fromNode !== null && this.session.nodePosition(cmd.fromNode) !== null
+        const toValid = cmd.toNode !== null && this.session.nodePosition(cmd.toNode) !== null
+        const a = fromValid ? cmd.fromNode! : this.session.addNode(cmd.fromX, cmd.fromY)
+        const b = toValid ? cmd.toNode! : this.session.addNode(cmd.toX, cmd.toY)
         this.session.addMember(a, b, cmd.material)
         break
       }
@@ -285,13 +307,19 @@ export class SimHost {
         break
       case 'setBackend': {
         // Both backends treat the SoA arrays as canonical, so a swap at a
-        // frame boundary migrates nothing.
+        // frame boundary migrates nothing - but the outgoing backend's
+        // device resources must be released promptly, and a no-op request
+        // must not mint a second device.
         if (cmd.backend === 'cpu') {
+          if (this.backendName === 'cpu') break
+          this.sim.solver.dispose?.()
           this.sim.solver = new CpuSolver(this.sim)
           this.backendName = 'cpu'
         } else {
+          if (this.backendName === 'webgpu') break
           const gpu = await GpuSolver.create(this.sim)
           if (gpu) {
+            this.sim.solver.dispose?.()
             this.sim.solver = gpu
             this.backendName = 'webgpu'
           } else {
@@ -309,14 +337,19 @@ export class SimHost {
         this.loadProbe(cmd.probe)
         break
       case 'loadDoc': {
-        this.session.doc = migrateLevel(cmd.level)
-        this.session.solution = migrateSolution(cmd.solution)
+        // Migrate BOTH before assigning EITHER: a throw mid-way (newer
+        // solution version, malformed field) must leave the session's
+        // doc/solution pair untouched, not half-replaced.
+        const level = migrateLevel(cmd.level)
+        const solution = migrateSolution(cmd.solution)
+        this.session.doc = level
+        this.session.solution = solution
         // The id counter restarts at zero each worker start; without claiming
         // the loaded ids, the next placed anchor collides with a saved one.
-        claimIds(allIds(this.session.doc, this.session.solution))
-        this.field.setWidth(this.session.doc.widthM)
+        claimIds(allIds(level, solution))
+        this.field.setWidth(level.widthM)
         this.session.rebuild()
-        this.post({ type: 'ack', requestId: cmd.requestId })
+        this.pendingAcks.push(cmd.requestId)
         break
       }
       case 'requestSave':

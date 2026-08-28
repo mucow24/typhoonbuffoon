@@ -13,15 +13,18 @@ import { fillWater, flatTerrain, makeWorld } from '../harness'
  * of a frame, not a flattering kernel-only figure.
  *
  * Measured on 2026-08-28 after the optimisation pass (dense sorted grid,
- * packed vec4 gathers, fused per-particle kernels): 16.4-17.4 ms/frame,
- * median ~16.7 - i.e. 60 Hz at the hardware floor, within thermal noise,
- * with ~13 ms of that on the GPU and ~3.5 ms in host passes + the readback
- * stall (recoverable later by pipelining the readback a frame behind).
- * The CPU reference needs ~156 ms for this scene on a fast desktop core.
+ * packed vec4 gathers, fused per-particle kernels) PLUS the review-mandated
+ * support margin (the CPU's rq slack for pairs closing mid-frame, scaled by
+ * substep so it only pays for drift actually accrued): 21-24 ms/frame,
+ * median ~23. Without the margin the same rig measured ~16.7 - that number
+ * had a physics gap. So the absolute floor adapter runs 40k at ~45 fps and
+ * holds 60 Hz to ~29k; the readback stall (~3 ms, recoverable by pipelining
+ * it a frame behind) is the known next lever. The CPU reference needs
+ * ~156 ms for this scene on a fast desktop core.
  *
- * The assertion is a REGRESSION GUARD at 20 ms on the median of three
+ * The assertion is a REGRESSION GUARD at 28 ms on the median of three
  * batches: it trips on any real slowdown while staying quiet across the
- * +-1 ms the shared iGPU adds run to run.
+ * +-1.5 ms the shared iGPU adds run to run.
  */
 
 describe('gpu throughput', () => {
@@ -30,6 +33,13 @@ describe('gpu throughput', () => {
     fillWater(sim, { x0: -110, x1: 110, yTop: 11.4 })
     const adapter = await navigator.gpu.requestAdapter()
     const device = await adapter!.requestDevice()
+    // A validation error invalidates the command buffer and submit becomes a
+    // no-op - which is FASTER. Without this listener, a fully broken solver
+    // would pass the timing assertion below.
+    const errors: string[] = []
+    device.addEventListener('uncapturederror', (e) => {
+      errors.push((e as GPUUncapturedErrorEvent).error.message)
+    })
     sim.solver = new GpuSolver(sim, device)
 
     const fluid = sim.fluidCount
@@ -50,6 +60,15 @@ describe('gpu throughput', () => {
       `[gpu-throughput] ${fluid} fluid particles: ` +
         `${batchMeans.map((m) => m.toFixed(2)).join(' / ')} ms/frame (median ${median.toFixed(2)})`,
     )
-    expect(median).toBeLessThan(20)
+    expect([...new Set(errors)]).toEqual([])
+    // The solver did real work: 2.5 s in, the fill has collapsed into a
+    // settling pool (volume conserved, everything on the field).
+    expect(sim.fluidCount).toBe(fluid)
+    const p = sim.particles
+    for (let i = 0; i < p.highWater; i++) {
+      if (p.slots.alive[i] !== 1) continue
+      expect(Number.isFinite(p.posX[i]!) && Number.isFinite(p.posY[i]!)).toBe(true)
+    }
+    expect(median).toBeLessThan(28)
   })
 })

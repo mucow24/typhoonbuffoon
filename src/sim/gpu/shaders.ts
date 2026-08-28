@@ -108,6 +108,27 @@ fn angle_delta(a: f32, b: f32) -> f32 {
 }
 `
 
+/**
+ * Grid-frame helpers - only for kernels that BIND gridS (WGSL requires every
+ * module-scope reference to resolve, bound or not).
+ *
+ * One word of frame-progress state lives after the grid's scan workspace:
+ * the substep counter (predict bumps it, gridClear zeroes it; cross-dispatch
+ * storage visibility makes it safely readable without atomics). The gather
+ * reach for a substep is the kernel radius plus however much support margin
+ * the frame-start binning has EARNED - neighbour drift accrues over
+ * substeps, so the margin does too, reaching the CPU's full rq by the last
+ * substep (fluid.ts:104-111 documents why the margin exists at all).
+ */
+const GRID_FNS = /* wgsl */ `
+fn substep_idx() -> u32 {
+  return U.tableSize + 1u + U.cap + (U.tableSize + 255u) / 256u;
+}
+fn gather_reach() -> f32 {
+  return U.hK + U.reachSlope * f32(gridS[substep_idx()]);
+}
+`
+
 /** Terrain helpers - need the terrain heights binding in scope. */
 const TERRAIN_FNS = /* wgsl */ `
 fn height_at(x: f32) -> f32 {
@@ -131,26 +152,29 @@ fn normal_at(x: f32) -> vec2f {
 `
 
 /**
- * Neighbour-gather loop over a cell ring with hash-collision dedupe
- * (spatialHash.ts collectBuckets). `body` sees `j: u32` (candidate index),
- * and must `continue` on its own filters. The loop caps accepted candidates
- * via the \`neigh\` counter the body increments.
+ * Neighbour-gather loop over the dense grid. `body` sees the candidate (slot
+ * `k` when `sortedSlots`, else particle index `j`) and must `continue` on
+ * its own filters; the \`neigh\` counter it increments caps candidates.
  *
- * The grid cell equals the KERNEL radius h, so the hot fluid gathers walk a
- * 3x3 ring; the census/hull passes need the wider PAIR radius rq = 1.375h
- * and walk 5x5 (`ring = 2`).
+ * Bounds are WORLD-SPACE: cells intersecting [pos - reach, pos + reach].
+ * The reach carries the CPU's support margin (rq = h + 0.75*spacing): the
+ * grid bins FRAME-START positions while gathers run per substep on CURRENT
+ * ones, so without the margin a fast-closing neighbour still binned two
+ * cells away is missed mid-frame - the exact failure fluid.ts:104-111
+ * documents - and the miss is one-sided, which injects momentum. Reach-based
+ * bounds give the exact margin at ~1.5x candidates instead of a full extra
+ * ring's ~2.8x.
  */
-const gatherLoop = (body: string, ring = 1, sortedSlots = false): string => /* wgsl */ `
-  let ccx = cell_x(xi);
-  let ccy = cell_y(yi);
-  let cx0 = select(ccx - ${ring}u, 0u, ccx < ${ring}u);
-  let cx1 = min(ccx + ${ring}u, U.gridW - 1u);
-  let cy0 = select(ccy - ${ring}u, 0u, ccy < ${ring}u);
-  let cy1 = min(ccy + ${ring}u, U.gridH - 1u);
+const gatherLoop = (body: string, reach = 'U.rq', sortedSlots = false): string => /* wgsl */ `
+  let reachW = ${reach};
+  let cx0 = cell_x(xi - reachW);
+  let cx1 = cell_x(xi + reachW);
+  let cy0 = cell_y(yi - reachW);
+  let cy1 = cell_y(yi + reachW);
   var neigh = 0u;
   for (var cy = cy0; cy <= cy1; cy++) {
     if (neigh >= MAX_NEIGHBOURS) { break; }
-    // A row of the ring is ONE contiguous run in the sorted entries.
+    // A row of the reach window is ONE contiguous run in the sorted entries.
     let rowBase = cell_key(cx0, cy);
     let end = gridS[cell_key(cx1, cy) + 1u];
     for (var k = gridS[rowBase]; k < end; k++) {
@@ -290,6 +314,7 @@ export const SRC_CENSUS = /* wgsl */ `
 @group(0) @binding(2) var<storage, read_write> pu: array<u32>;
 @group(0) @binding(3) var<storage, read_write> gridS: array<u32>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
@@ -312,7 +337,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       wet++;
       svx += pf[pf_i(PF_VELX, j)];
       svy += pf[pf_i(PF_VELY, j)];
-    `, 2)}
+    `)}
   }
   pu[pu_i(PU_WET, i)] = wet;
   pf[pf_i(PF_WETVX, i)] = svx;
@@ -346,10 +371,14 @@ export const SRC_PREDICT = /* wgsl */ `
 @group(0) @binding(2) var<storage, read_write> pu: array<u32>;
 @group(0) @binding(3) var<storage, read_write> df: array<f32>;
 @group(0) @binding(4) var<storage, read_write> bf: array<f32>;
+@group(0) @binding(5) var<storage, read_write> gridS: array<u32>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
+  // Frame progress for the drift-scaled gather reach.
+  if (i == 0u) { gridS[substep_idx()] = gridS[substep_idx()] + 1u; }
   if (i < U.distHW) { df[df_i(DF_LAMBDA, i)] = 0.0; }
   if (i < U.bendHW) { bf[bf_i(BF_LAMBDA, i)] = 0.0; }
   if (i >= U.n) { return; }
@@ -761,6 +790,7 @@ export const SRC_FLUID_DENSITY = /* wgsl */ `
 @group(0) @binding(3) var<storage, read_write> gridS: array<u32>;
 @group(0) @binding(4) var<storage, read_write> gath: array<vec4f>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let kSelf = gid.x;
@@ -794,7 +824,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     gIX += gx;
     gIY += gy;
     gradSum += gx * gx + gy * gy;
-  `, 1, true)}
+  `, 'gather_reach()', true)}
 
   pf[pf_i(PF_DENSITY, i)] = density;
   // Resist compression only (fluid.ts lambda pass), with the same error clamp.
@@ -826,6 +856,7 @@ export const SRC_FLUID_CORRECT = /* wgsl */ `
 @group(0) @binding(4) var<storage, read_write> fx: array<atomic<i32>>;
 @group(0) @binding(5) var<storage, read_write> gath: array<vec4f>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let kSelf = gid.x;
@@ -885,7 +916,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
           }
         }
       }
-    `, 1, true)}
+    `, 'gather_reach()', true)}
   }
   pf[pf_i(PF_DPX, i)] = dpx;
   pf[pf_i(PF_DPY, i)] = dpy;
@@ -951,6 +982,7 @@ export const SRC_CONTACTS_SOLID = /* wgsl */ `
 @group(0) @binding(2) var<storage, read_write> pu: array<u32>;
 @group(0) @binding(3) var<storage, read_write> gridS: array<u32>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
@@ -990,7 +1022,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     accX += nx * scale * wi;
     accY += ny * scale * wi;
     hits++;
-  `)}
+  `, "gather_reach()")}
 
   pf[pf_i(PF_CONX, i)] += accX;
   pf[pf_i(PF_CONY, i)] += accY;
@@ -1290,6 +1322,7 @@ export const SRC_HULL_FLUID = /* wgsl */ `
 @group(0) @binding(2) var<storage, read_write> pu: array<u32>;
 @group(0) @binding(3) var<storage, read_write> gridS: array<u32>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
@@ -1325,7 +1358,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let shareI = wi / wSum;
     dvxAcc += dvx * c * shareI;
     dvyAcc += dvy * c * shareI;
-  `, 2)}
+  `, "(gather_reach() + (U.rq - U.hK))")}
 
   pf[pf_i(PF_VELX, i)] += dvxAcc;
   pf[pf_i(PF_VELY, i)] += dvyAcc;
@@ -1339,6 +1372,7 @@ export const SRC_HULL_SOLID = /* wgsl */ `
 @group(0) @binding(2) var<storage, read_write> pu: array<u32>;
 @group(0) @binding(3) var<storage, read_write> gridS: array<u32>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let j = gid.x;
@@ -1375,7 +1409,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let shareJ = wj / wSum;
     dvxAcc -= dvx * c * shareJ;
     dvyAcc -= dvy * c * shareJ;
-  `, 2).replace(/\blet j = /g, 'let j2 = ')}
+  `, "(gather_reach() + (U.rq - U.hK))").replace(/\blet j = /g, 'let j2 = ')}
 
   pf[pf_i(PF_VELX, j)] += dvxAcc;
   pf[pf_i(PF_VELY, j)] += dvyAcc;
@@ -1421,6 +1455,7 @@ export const SRC_XSPH = /* wgsl */ `
 @group(0) @binding(3) var<storage, read_write> gridS: array<u32>;
 @group(0) @binding(4) var<storage, read_write> gath: array<vec4f>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let kSelf = gid.x;
@@ -1451,7 +1486,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     numX += (q.z - vix) * w;
     numY += (q.w - viy) * w;
     wsum += w;
-  `, 1, true)}
+  `, 'gather_reach()', true)}
 
   if (wsum <= 1e-12) { return; }
   pf[pf_i(PF_VELX, i)] = vix + (numX / wsum) * U.xsphVisc;
@@ -1463,9 +1498,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 export const SRC_GRID_CLEAR = /* wgsl */ `
 @group(0) @binding(0) var<uniform> U: UStruct;
 @group(0) @binding(1) var<storage, read_write> gridA: array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> gridS: array<u32>;
 ${COMMON}
+${GRID_FNS}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x == 0u) { gridS[substep_idx()] = 0u; }
   if (gid.x >= U.tableSize) { return; }
   atomicStore(&gridA[gid.x], 0u);
 }

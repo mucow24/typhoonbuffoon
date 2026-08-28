@@ -12,7 +12,7 @@
     "test": "vitest --project unit",
     "test:run": "vitest run --project unit",
     "test:gpu": "vitest run --project gpu",
-    "test:all": "vitest run"
+    "test:all": "vitest run --project unit && vitest run --project gpu"
   },
   "dependencies": {
     "pixi.js": "^8.20.0"

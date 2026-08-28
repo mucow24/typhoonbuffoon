@@ -28,6 +28,8 @@ export interface SolverBackend {
    * copy - one frame lagged on the pipelined path.
    */
   readback(): Promise<void>
+  /** Release device resources on backend swap. CPU backends have none. */
+  dispose?(): void
 }
 
 /** Frame-level wave forcing, set by Conditions, applied by the backend -

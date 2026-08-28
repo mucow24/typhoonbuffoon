@@ -54,14 +54,19 @@ const WG: Partial<Record<KernelName, number>> = {
  * backend, and swapping backends mid-session needs no migration at all.
  */
 export class GpuSolver implements SolverBackend {
-  /** Probe for a device; null when WebGPU is unavailable. */
+  /** Probe for a device; null when WebGPU is unavailable or refuses one -
+   *  the caller falls back to the CPU reference, never crashes. */
   static async create(w: SimWorld): Promise<GpuSolver | null> {
-    const gpu = (globalThis.navigator as Navigator | undefined)?.gpu
-    if (!gpu) return null
-    const adapter = await gpu.requestAdapter()
-    if (!adapter) return null
-    const device = await adapter.requestDevice()
-    return new GpuSolver(w, device)
+    try {
+      const gpu = (globalThis.navigator as Navigator | undefined)?.gpu
+      if (!gpu) return null
+      const adapter = await gpu.requestAdapter()
+      if (!adapter) return null
+      const device = await adapter.requestDevice()
+      return new GpuSolver(w, device)
+    } catch {
+      return null
+    }
   }
 
   private readonly pipelines = new Map<KernelName, GPUComputePipeline>()
@@ -77,6 +82,7 @@ export class GpuSolver implements SolverBackend {
   private bendCap = 0
   private clusterCap = 0
   private terrCap = 4096
+  private clusterStagingCap = 64
   private tableSize = 0
   private tableCap = 0
   private stag: StagingLayout | null = null
@@ -125,7 +131,9 @@ export class GpuSolver implements SolverBackend {
     this.matSecUpload()
   }
 
-  destroy(): void {
+  /** SolverBackend.dispose: release the device promptly on backend swap -
+   *  the JS wrapper is tiny, the GPU allocations behind it are not. */
+  dispose(): void {
     this.device.destroy()
   }
 
@@ -136,11 +144,13 @@ export class GpuSolver implements SolverBackend {
     const p = w.particles
     this.ensureCapacity()
 
-    // Dense grid geometry FIRST: growing it rebuilds every bind group, so it
-    // must precede anything that creates per-frame bind groups (colours).
-    // Cell = KERNEL radius h (hot gathers walk 3x3, the pair-radius census
-    // and hull walk 5x5) unless the field is so large the table would blow
-    // the cap - then cells grow, which only adds candidates.
+    // BUFFER SIZING FIRST - grid geometry and the terrain buffer. Growth on
+    // either path rebuilds every bind group, so both must precede anything
+    // that creates per-frame bind groups (the colour groups below); a grow
+    // that ran later silently cleared them, and joints stopped solving.
+    // Grid cell = KERNEL radius h; gathers walk world-space reach windows
+    // (see shaders.ts gatherLoop). Cells grow only if the field is so large
+    // the table would blow its cap - that just adds candidates.
     const fGrid = w.fluid
     const tGrid = w.terrain
     const MARGIN = 4
@@ -159,6 +169,16 @@ export class GpuSolver implements SolverBackend {
     this.tableSize = gridW * gridH
     this.ensureGrid(this.tableSize)
     const gridGeom = { gridW, gridH, gridX0: w.boundsX0 - MARGIN * cell, gridY0: yLow - MARGIN * cell, cell }
+
+    if (tGrid && tGrid.heights.length > this.terrCap) {
+      this.terrCap = Math.max(tGrid.heights.length, this.terrCap * 2)
+      this.terr.destroy()
+      this.terr = this.device.createBuffer({
+        size: this.terrCap * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      })
+      this.buildPipelines()
+    }
 
     const q = this.device.queue
     const n = p.highWater
@@ -304,19 +324,9 @@ export class GpuSolver implements SolverBackend {
       q.writeBuffer(this.clU, 0, clUData)
     }
 
-    // Terrain (small; re-upload unconditionally). The field width is
-    // deliberately unclamped, so the buffer must follow the sample count.
+    // Terrain heights (small; sized in the buffer-sizing block above).
     const t = w.terrain
     if (t && t.heights.length > 0) {
-      if (t.heights.length > this.terrCap) {
-        this.terrCap = Math.max(t.heights.length, this.terrCap * 2)
-        this.terr.destroy()
-        this.terr = this.device.createBuffer({
-          size: this.terrCap * 4,
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-        })
-        this.buildPipelines()
-      }
       q.writeBuffer(this.terr, 0, t.heights.buffer, t.heights.byteOffset, t.heights.length * 4)
     }
 
@@ -374,6 +384,7 @@ export class GpuSolver implements SolverBackend {
       spacing,
       hK,
       h2,
+      rq,
       rq2: rq * rq,
       poly6,
       spiky: -30 / (Math.PI * Math.pow(hK, 5)),
@@ -437,6 +448,7 @@ export class GpuSolver implements SolverBackend {
     values.dt = dt
     values.h = h
     values.maxCorrSub = w.fluid.maxCorrectionSpeed * h
+    values.reachSlope = (w.fluid.spacing * w.fluid.supportMargin) / substeps
     values.keepNode = w.linearDamping > 0 ? Math.exp(-w.linearDamping * h) : 1
     values.keepFluid = w.fluidDamping > 0 ? Math.exp(-w.fluidDamping * h) : 1
     values.fricSolid = Math.pow(w.groundFriction, 1 / substeps)
@@ -624,8 +636,7 @@ export class GpuSolver implements SolverBackend {
       distCap === this.distCap &&
       bendCap === this.bendCap &&
       clusterCap <= this.clusterCap &&
-      this.stag &&
-      this.stag.clusterPose + clusterCount * CL_HEADER_F * 4 <= this.stag.totalBytes
+      clusterCount <= this.clusterStagingCap
     ) {
       return
     }
@@ -634,6 +645,10 @@ export class GpuSolver implements SolverBackend {
     this.distCap = Math.max(distCap, 64)
     this.bendCap = Math.max(bendCap, 64)
     this.clusterCap = Math.max(clusterCap, this.clusterCap)
+    // Staging cluster capacity GROWS (doubling) - a fixed cap here meant a
+    // world with one cluster more than it re-allocated every buffer every
+    // frame, forever.
+    while (clusterCount > this.clusterStagingCap) this.clusterStagingCap *= 2
     this.scratchU32 = new Uint32Array(Math.max(cap, this.distCap, this.bendCap))
 
     const dev = this.device
@@ -670,15 +685,13 @@ export class GpuSolver implements SolverBackend {
     this.gath?.destroy()
     this.gath = make(cap * 4) // vec4f per particle
     this.terr?.destroy()
-    this.terr = make(4096)
+    this.terr = make(this.terrCap) // sized in sync's buffer-sizing block
     if (!this.matSec) {
       this.matSec = make(MATERIAL_IDS.length)
       this.matSecUpload()
     }
 
-    // Staging sized for a generous cluster count so add-object doesn't
-    // reallocate every time.
-    this.stag = stagingLayout(cap, this.distCap, this.bendCap, 64)
+    this.stag = stagingLayout(cap, this.distCap, this.bendCap, this.clusterStagingCap)
     this.staging?.destroy()
     this.staging = dev.createBuffer({
       size: this.stag.totalBytes,
@@ -699,7 +712,8 @@ export class GpuSolver implements SolverBackend {
     const blocks = Math.ceil(this.tableCap / 256)
     this.gridS?.destroy()
     this.gridS = this.device.createBuffer({
-      size: (this.tableCap + 1 + this.cap + blocks) * 4,
+      // +1: the substep-counter word after the scan workspace (shaders.ts).
+      size: (this.tableCap + 1 + this.cap + blocks + 1) * 4,
       usage: S,
     })
     this.gridA?.destroy()
@@ -735,7 +749,7 @@ export class GpuSolver implements SolverBackend {
       gath,
     } = this
     return {
-      gridClear: [uni, gridA],
+      gridClear: [uni, gridA, gridS],
       packGather: [uni, pf, pu, gridS, gath],
       gridCount: [uni, pf, pu, gridA],
       gridScan1: [uni, gridS, gridA],
@@ -744,7 +758,7 @@ export class GpuSolver implements SolverBackend {
       gridScatter: [uni, pf, pu, gridS, gridA],
       census: [uni, pf, pu, gridS],
       wave: [uni, pf, pu],
-      predict: [uni, pf, pu, df, bf],
+      predict: [uni, pf, pu, df, bf, gridS],
       cluster: [uni, pf, pu, clF, clU],
       distSolve: [uni, pf, pu, df, du, colorIdx],
       distDamp: [uni, pf, pu, df, du, colorIdx],

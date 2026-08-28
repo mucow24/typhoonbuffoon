@@ -216,7 +216,7 @@ describe('SimHost', () => {
   })
 
   it('reports breakage as events and a rising break count', async () => {
-    const { host, frame, last } = makeHost()
+    const { host, frame, last, snapshots } = makeHost()
     host.enqueue({ type: 'loadProbe', probe: 'loadtest' })
     host.enqueue({ type: 'togglePause' })
     // 8 tonnes on a wood cantilever: it must fail within a few seconds.
@@ -224,11 +224,127 @@ describe('SimHost', () => {
     await frame()
     const snap = last()
     expect(snap.scalars.breakCount).toBeGreaterThan(0)
-    // Events carried real positions for FX: finite, on the field.
-    const all = last()
-    const everyEvent = [...all.events]
-    // Events may have been flushed in an earlier snapshot; collect from all.
-    expect(snap.scalars.breakCount).toBeGreaterThanOrEqual(everyEvent.length)
+    // Every break delivered exactly once across the snapshot stream, and
+    // each event carries a real position for FX: finite, on the field.
+    const everyEvent = snapshots().flatMap((s) => s.events)
+    expect(everyEvent.length).toBe(snap.scalars.breakCount)
+    for (const e of everyEvent) {
+      expect(Number.isFinite(e.x) && Number.isFinite(e.y)).toBe(true)
+      expect(Math.abs(e.x)).toBeLessThanOrEqual(60)
+      expect(Number.isFinite(e.strain)).toBe(true)
+    }
+  })
+
+  it('setBackend swaps to cpu, and webgpu falls back loudly where none exists', async () => {
+    const { host, frame, last } = makeHost()
+    await frame()
+    expect(last().scalars.backend).toBe('cpu') // Node construction default
+
+    // Requesting webgpu in Node (no navigator.gpu) must degrade, not crash,
+    // and SAY SO in the scalar the HUD shows.
+    host.enqueue({ type: 'setBackend', backend: 'webgpu' })
+    await frame()
+    expect(last().scalars.backend).toBe('cpu (no webgpu)')
+
+    host.enqueue({ type: 'setBackend', backend: 'cpu' })
+    await frame()
+    expect(last().scalars.backend).toBe('cpu')
+    // The sim still steps after the swap.
+    host.enqueue({ type: 'splash', x: 0, y: host.field.terrain.heightAt(0) + 10 })
+    host.enqueue({ type: 'togglePause' })
+    host.enqueue({ type: 'pump', steps: 5, requestId: 9 })
+    await frame()
+    expect(fluidStats(last()).count).toBeGreaterThan(10)
+  })
+
+  it('a failing command nacks instead of hanging, and leaves state whole', async () => {
+    const { host, messages, frame, last } = makeHost()
+    host.enqueue({
+      type: 'buildMember',
+      fromNode: null,
+      fromX: 0,
+      fromY: 6,
+      toNode: null,
+      toX: 4,
+      toY: 6,
+      material: 'wood',
+    })
+    await frame()
+
+    // A level from a NEWER build: migrateLevel throws. The doc/solution pair
+    // must survive untouched and the requester must get a nack, not silence.
+    host.enqueue({
+      type: 'loadDoc',
+      level: { version: 999 },
+      solution: { version: 1, nodes: [], members: [] },
+      requestId: 42,
+    })
+    await frame()
+    const nack = messages.find((m) => m.type === 'nack')
+    expect(nack).toBeDefined()
+    if (nack?.type !== 'nack') throw new Error('unreachable')
+    expect(nack.requestId).toBe(42)
+    expect(nack.error).toContain('newer')
+    // The pre-load world is intact - not half-replaced.
+    expect(last().scalars.memberCount).toBe(1)
+
+    // And the queue keeps draining afterwards.
+    host.enqueue({ type: 'setWind', kph: 30 })
+    await frame()
+    expect(messages.filter((m) => m.type === 'snapshot').length).toBeGreaterThan(2)
+  })
+
+  it('commands arriving mid-step apply at the next frame boundary, never inside the frame', async () => {
+    const { host, frame, last } = makeHost()
+    // A deliberately slow async backend: readbacks park until released, the
+    // way a GPU frame parks the worker on its staging map. The latch frees
+    // every parked AND future readback - one tick can run several catch-up
+    // steps, each with its own readback.
+    let released = false
+    const parked: (() => void)[] = []
+    let stepsEntered = 0
+    const release = () => {
+      released = true
+      for (const r of parked.splice(0)) r()
+    }
+    const before = host.sim.solver
+    host.sim.solver = {
+      sync: () => {},
+      step: () => {
+        stepsEntered++
+      },
+      readback: () =>
+        released ? Promise.resolve() : new Promise<void>((res) => parked.push(res)),
+    }
+    const flush = async () => {
+      for (let i = 0; i < 50; i++) await Promise.resolve()
+    }
+
+    // Start a tick; it drains the unpause, then parks inside the fake
+    // readback mid-frame. (No awaited frame() before this - the fake solver
+    // parks EVERY unpaused frame until released.)
+    host.enqueue({ type: 'togglePause' })
+    const ticking = host.tick(100)
+    await flush()
+    expect(stepsEntered).toBeGreaterThan(0)
+    expect(parked.length).toBe(1)
+
+    // A command lands mid-step. If it applied now, the splash would mutate
+    // the particle store while the "GPU" owns the frame.
+    const fluidBefore = host.sim.fluidCount
+    host.enqueue({ type: 'splash', x: 0, y: host.field.terrain.heightAt(0) + 10 })
+    await flush()
+    const appliedDuringStep = host.sim.fluidCount !== fluidBefore
+
+    release()
+    await ticking
+    expect(appliedDuringStep).toBe(false)
+
+    // Next frame boundary: the queued splash applies.
+    host.sim.solver = before
+    host.enqueue({ type: 'setPaused', paused: true })
+    await frame()
+    expect(fluidStats(last()).count).toBeGreaterThan(fluidBefore)
   })
 
   it('reset restores the play snapshot and pauses', async () => {

@@ -25,12 +25,21 @@ scope.onmessage = (e: MessageEvent) => {
   else early.push(cmd)
 }
 
-void SimHost.create((msg, transfer) =>
-  transfer ? scope.postMessage(msg, { transfer }) : scope.postMessage(msg),
-).then((h) => {
+const post = (msg: unknown, transfer?: Transferable[]) =>
+  transfer ? scope.postMessage(msg, { transfer }) : scope.postMessage(msg)
+
+const boot = (h: SimHost) => {
   host = h
   for (const cmd of early) h.enqueue(cmd)
   early.length = 0
   h.start(performance.now())
   setInterval(() => void h.tick(performance.now()), 4)
-})
+}
+
+SimHost.create(post)
+  .then(boot)
+  .catch(() =>
+    // A GPU probe blowing up must degrade to the CPU reference, not leave a
+    // dead worker silently swallowing every command.
+    SimHost.create(post, { backend: 'cpu' }).then(boot),
+  )

@@ -154,8 +154,14 @@ export interface SnapshotMessage {
 export type HostMessage =
   | SnapshotMessage
   | { type: 'saveData'; requestId: number; level: LevelDoc; solution: Solution }
-  /** Completion of a pump or loadDoc request. */
+  /** Completion of a pump or loadDoc request - posted AFTER the snapshot
+   *  that reflects the change, so an awaiting caller reading client.latest
+   *  observes post-command state. */
   | { type: 'ack'; requestId: number }
+  /** A command failed. Carries the request id when the command had one (the
+   *  client rejects that promise); fire-and-forget commands surface the
+   *  error without hanging anything. */
+  | { type: 'nack'; requestId: number | null; error: string }
 
 /** Both ends of the wire, shaped so Node tests can join them with a loopback. */
 export interface CommandPort {

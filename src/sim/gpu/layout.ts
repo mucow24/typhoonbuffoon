@@ -113,7 +113,12 @@ export const UNIFORM_FIELDS: readonly (readonly [string, 'u32' | 'f32'])[] = [
   ['spacing', 'f32'],
   ['hK', 'f32'],
   ['h2', 'f32'],
+  ['rq', 'f32'],
   ['rq2', 'f32'],
+  /** Per-substep growth of the gather reach, (rq - h) / substeps: the
+   *  support margin only needs to cover drift accrued SINCE the frame-start
+   *  binning, so early substeps gather narrow and the last reaches rq. */
+  ['reachSlope', 'f32'],
   ['poly6', 'f32'],
   ['spiky', 'f32'],
   ['pmass', 'f32'],

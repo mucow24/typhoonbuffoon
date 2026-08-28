@@ -3,7 +3,7 @@ import { GpuSolver } from '../../src/sim/gpu/gpuSolver'
 import { CpuSolver } from '../../src/sim/solver'
 import { SimWorld } from '../../src/sim/world'
 import { KIND_FLUID } from '../../src/sim/particles'
-import { buildBeam } from '../../src/scenes/demos'
+import { buildBeam, buildLoadTest } from '../../src/scenes/demos'
 import {
   basinTerrain,
   buildWall,
@@ -257,8 +257,52 @@ describe('gpu parity', () => {
     const meanCpu = sumCpu / 60
     const meanGpu = sumGpu / 60
     // Both float (above the bed, below flight), at the same mean draft.
-    expect(meanGpu).toBeGreaterThan(2)
+    // Floor 1.7: the CPU reference itself sits ~2.03, and an absolute floor
+    // tangent to the reference is a flake, not a check.
+    expect(meanGpu).toBeGreaterThan(1.7)
     expect(meanGpu).toBeLessThan(4)
     expect(Math.abs(meanGpu - meanCpu)).toBeLessThan(0.3)
+  })
+
+  it('two crates stack instead of passing through (object-object contacts)', async () => {
+    const { cpu, gpu } = twinWorlds((sim) => {
+      sim.addObject({ cx: 0, cy: 0.8, width: 1.6, height: 1, density: 400 })
+      sim.addObject({ cx: 0.1, cy: 2.4, width: 1.6, height: 1, density: 400 })
+    })
+    await run(cpu, gpu, 240)
+    const [botG, topG] = [gpu.clusters[0]!, gpu.clusters[1]!]
+    // The top crate must REST ON the bottom one: roughly one crate height
+    // above it, not merged into it and not on the ground beside it.
+    const gapG = topG.cy - botG.cy
+    expect(gapG).toBeGreaterThan(0.8)
+    expect(gapG).toBeLessThan(1.5)
+    // And within a band of the CPU stack.
+    const gapC = cpu.clusters[1]!.cy - cpu.clusters[0]!.cy
+    expect(Math.abs(gapG - gapC)).toBeLessThan(0.2)
+  })
+
+  it('an overloaded wood cantilever breaks on both backends (strain readback drives damage)', async () => {
+    const { cpu, gpu } = twinWorlds((sim) => {
+      buildLoadTest(sim, { x: 0, y: 8, material: 'wood', tipMassKg: 8000 })
+    })
+    // Run until the CPU reference has broken members, then give the GPU the
+    // same wall-clock budget plus slack for band divergence.
+    let frames = 0
+    while (cpu.breakEvents.length === 0 && frames < 600) {
+      cpu.step(1 / 60)
+      await gpu.stepAsync(1 / 60)
+      frames++
+    }
+    expect(cpu.breakEvents.length).toBeGreaterThan(0)
+    for (let i = 0; i < 120 && gpu.breakEvents.length === 0; i++) {
+      await gpu.stepAsync(1 / 60)
+    }
+    // The GPU path breaks too - its strain/angle readback feeds the same
+    // frame-tail damage logic - and the break sites are physically sane.
+    expect(gpu.breakEvents.length).toBeGreaterThan(0)
+    for (const e of gpu.breakEvents) {
+      expect(Number.isFinite(e.x) && Number.isFinite(e.y)).toBe(true)
+      expect(Math.abs(e.x)).toBeLessThan(20)
+    }
   })
 })
