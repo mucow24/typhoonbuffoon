@@ -12,8 +12,8 @@ changes.
 ## Status: SHIPPED (2026-08-28) - P1-P4 landed on this branch
 
 Measured on the Intel UHD (gen-12lp) adapter, the hardware floor the goal
-was stated against: **40.5k fluid particles at 21-24 ms/frame (median ~23 =
-~45 fps), with 60 Hz holding to ~29k**; the game's own beach scene (22.6k
+was stated against: **40.5k fluid particles at ~20 ms/frame (~50 fps), with
+60 Hz holding to ~33k**; the game's own beach scene (22.6k
 fluid) runs comfortably inside the frame budget. The CPU reference needs
 ~156 ms for the 40k scene, so the floor-adapter speedup is ~7x - and this
 adapter is the worst case of the worst case (shared with the desktop
@@ -22,10 +22,12 @@ outright. An earlier ~16.7 ms median was measured before the adversarial
 review caught that the gathers lacked the CPU's mid-frame support margin;
 correctness cost ~6 ms (the margin is substep-scaled, paying only for the
 binning drift actually accrued). The wall number includes host passes, full
-state upload, encoding, submission and the readback stall (~3 ms of it -
-recoverable by pipelining the readback one frame behind, at the cost of
-frame-lagged host logic; the obvious next lever if 40k @ 60 on this exact
-adapter ever becomes a hard requirement).
+state upload, encoding and submission. The readback is PIPELINED one frame
+behind (consumed at the top of the next step): a hard lesson, not an
+optimisation - the mapAsync round trip is 1-3 ms headless but up to ~25 ms
+in interactive tabs and on Optimus dGPU paths, and awaiting it in line
+capped even an IDLE scene below 60 Hz. Host logic sees positions one frame
+old, the lag this plan always budgeted for.
 
 What shipped matches this plan with three notable learnings:
 

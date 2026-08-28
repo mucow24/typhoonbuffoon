@@ -15,12 +15,13 @@ import { fillWater, flatTerrain, makeWorld } from '../harness'
  * Measured on 2026-08-28 after the optimisation pass (dense sorted grid,
  * packed vec4 gathers, fused per-particle kernels) PLUS the review-mandated
  * support margin (the CPU's rq slack for pairs closing mid-frame, scaled by
- * substep so it only pays for drift actually accrued): 21-24 ms/frame,
- * median ~23. Without the margin the same rig measured ~16.7 - that number
- * had a physics gap. So the absolute floor adapter runs 40k at ~45 fps and
- * holds 60 Hz to ~29k; the readback stall (~3 ms, recoverable by pipelining
- * it a frame behind) is the known next lever. The CPU reference needs
- * ~156 ms for this scene on a fast desktop core.
+ * substep so it only pays for drift actually accrued) and the PIPELINED
+ * readback (consumed at the top of the next step, so the mapAsync round
+ * trip - up to ~25 ms in some interactive environments, the thing that once
+ * capped an IDLE scene below 60 Hz - is off the critical path entirely):
+ * ~20 ms/frame median. So the absolute floor adapter runs 40k at ~50 fps
+ * and holds 60 Hz to ~33k; idle cost is now latency-independent (measured
+ * 0.24 ms/step live). The CPU reference needs ~156 ms for this scene.
  *
  * The assertion is a REGRESSION GUARD at 28 ms on the median of three
  * batches: it trips on any real slowdown while staying quiet across the

@@ -130,6 +130,11 @@ export class SimHost {
     this.ticking = true
     this.tickNow = now
     try {
+      // Consume any in-flight GPU frame BEFORE commands touch the particle
+      // store: a mutation applied under a pending frame would be clobbered
+      // when that frame's results land. (No-op on CPU, and when nothing is
+      // pending.)
+      await this.sim.solver.readback()
       await this.drainCommands()
       await this.stepper.advanceAsync(now)
     } finally {
@@ -173,12 +178,24 @@ export class SimHost {
 
   // ---------------------------------------------------------------- stepping
 
+  /**
+   * One fixed step, PIPELINED: land the previous frame's GPU results first
+   * (they have had a whole frame to complete, so this await is ~free), then
+   * mutate on that consistent state, then submit this frame WITHOUT waiting
+   * for it. Awaiting the readback in line instead put a full GPU round trip
+   * - 1 to 25 ms depending on browser/adapter path - inside every step,
+   * which capped even an IDLE scene below 60 Hz on some machines. Host
+   * logic (forces, damage, snapshots, spawn guards) sees positions one
+   * frame old, exactly the lag the plan budgeted for. On the CPU backend
+   * readback is a no-op and this is the same synchronous step as ever.
+   */
   private async fixedUpdate(dt: number): Promise<void> {
     if (this.paused) return
     const t0 = performance.now()
+    await this.sim.solver.readback()
     this.conditions.update(dt)
     if (this.stream) this.emitter.update(this.sim, dt, this.stream.x, this.stream.y)
-    await this.sim.stepAsync(dt)
+    this.sim.step(dt)
     // Every frame, before any command can act on member records: breakage
     // frees constraint slots, and the session must forget those indices
     // before the free list recycles them into someone else's constraints.

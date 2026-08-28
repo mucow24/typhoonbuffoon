@@ -109,7 +109,9 @@ export class GpuSolver implements SolverBackend {
   private terr!: GPUBuffer
   private matSec!: GPUBuffer
   private gath!: GPUBuffer
-  private staging!: GPUBuffer
+  /** Ping-pong readback stagings: one in flight (mapped), one to write. */
+  private stagingPair: GPUBuffer[] = []
+  private stagingFlip = 0
 
   /** Debug-only: kernels to skip while bisecting performance. */
   skipKernels: Set<KernelName> | null = null
@@ -139,6 +141,9 @@ export class GpuSolver implements SolverBackend {
   /** SolverBackend.dispose: release the device promptly on backend swap -
    *  the JS wrapper is tiny, the GPU allocations behind it are not. */
   dispose(): void {
+    // A pending map rejects on destroy; its .then handler turns that into a
+    // skipped apply rather than an unhandled rejection.
+    this.pending = null
     this.device.destroy()
   }
 
@@ -536,10 +541,13 @@ export class GpuSolver implements SolverBackend {
     }
     pass.end()
 
-    // Stage the frame's outputs for readback.
+    // Stage the frame's outputs for readback - into the HALF of the
+    // ping-pong pair that is not still mapped by the pending frame.
     const st = this.stag!
+    const staging = this.stagingPair[this.stagingFlip]!
+    this.stagingFlip ^= 1
     const cp = (src: GPUBuffer, srcOff: number, dstOff: number, words: number) => {
-      if (words > 0) enc.copyBufferToBuffer(src, srcOff, this.staging, dstOff, words * 4)
+      if (words > 0) enc.copyBufferToBuffer(src, srcOff, staging, dstOff, words * 4)
     }
     cp(this.pf, PF.posX * this.cap * 4, st.posX, n)
     cp(this.pf, PF.posY * this.cap * 4, st.posY, n)
@@ -554,17 +562,58 @@ export class GpuSolver implements SolverBackend {
     cp(this.clF, 0, st.clusterPose, this.liveClusters.length * CL_HEADER_F)
 
     this.device.queue.submit([enc.finish()])
+
+    // Map starts NOW; it resolves whenever the GPU finishes the frame. The
+    // caller decides when to await it - the pipelined host consumes it at
+    // the TOP of the NEXT step, by which point it has had a whole frame to
+    // complete, so the mapAsync round-trip latency (1-25 ms depending on
+    // environment - the thing that capped an IDLE scene at 45 Hz when
+    // awaited in line) leaves the critical path entirely.
+    this.pending = {
+      staging,
+      stag: st,
+      n,
+      distHW: this.frameDistHW,
+      bendHW: this.frameBendHW,
+      clusters: this.liveClusters,
+      map: staging.mapAsync(GPUMapMode.READ).then(
+        () => true,
+        () => false, // device lost / disposed mid-flight: skip the apply
+      ),
+    }
   }
 
   // --------------------------------------------------------------- readback
 
+  /** One submitted frame whose results have not been consumed yet. */
+  private pending: {
+    staging: GPUBuffer
+    stag: StagingLayout
+    n: number
+    distHW: number
+    bendHW: number
+    clusters: { cx: number; cy: number; angle: number }[]
+    map: Promise<boolean>
+  } | null = null
+
+  /**
+   * Consume the oldest submitted frame into the SoA arrays, if any. The
+   * synchronous path (tests, parity) calls this right after step() for
+   * exact depth-0 semantics; the host calls it at the START of each step,
+   * making the pipeline depth 1 and the stall ~zero. All sizes and targets
+   * come from the pending record - the world may have changed since.
+   */
   async readback(): Promise<void> {
+    const pend = this.pending
+    if (!pend) return
+    this.pending = null
+    const ok = await pend.map
+    if (!ok) return
+
     const w = this.w
     const p = w.particles
-    const n = this.frameN
-    const st = this.stag!
-    await this.staging.mapAsync(GPUMapMode.READ)
-    const buf = this.staging.getMappedRange()
+    const { n, stag: st, staging } = pend
+    const buf = staging.getMappedRange()
     const f32 = (off: number, len: number) => new Float32Array(buf, off, len)
     const u32 = (off: number, len: number) => new Uint32Array(buf, off, len)
 
@@ -598,17 +647,18 @@ export class GpuSolver implements SolverBackend {
       w.fluid.liveCount = live
     }
 
-    if (this.frameDistHW > 0) w.distance.strain.set(f32(st.dStrain, this.frameDistHW))
-    if (this.frameBendHW > 0) w.bend.angle.set(f32(st.bAngle, this.frameBendHW))
+    if (pend.distHW > 0) w.distance.strain.set(f32(st.dStrain, pend.distHW))
+    if (pend.bendHW > 0) w.bend.angle.set(f32(st.bAngle, pend.bendHW))
 
-    const poses = f32(st.clusterPose, this.liveClusters.length * CL_HEADER_F)
-    this.liveClusters.forEach((c, ci) => {
+    // Clusters destroyed since submission just receive a pose nobody reads.
+    const poses = f32(st.clusterPose, pend.clusters.length * CL_HEADER_F)
+    pend.clusters.forEach((c, ci) => {
       c.cx = poses[ci * CL_HEADER_F + 2]!
       c.cy = poses[ci * CL_HEADER_F + 3]!
       c.angle = poses[ci * CL_HEADER_F + 4]!
     })
 
-    this.staging.unmap()
+    staging.unmap()
 
     // Spawn-admission occupancy (hasFluidNear) reads the CPU hash, which the
     // CPU solver builds in beginFrame. Rebuild it here from the read-back
@@ -697,11 +747,16 @@ export class GpuSolver implements SolverBackend {
     }
 
     this.stag = stagingLayout(cap, this.distCap, this.bendCap, this.clusterStagingCap)
-    this.staging?.destroy()
-    this.staging = dev.createBuffer({
-      size: this.stag.totalBytes,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    })
+    // Capacity changes only happen after the pending frame was consumed
+    // (sync runs after readback in every step), so the pair is free here.
+    for (const s of this.stagingPair) s.destroy()
+    this.stagingPair = [0, 1].map(() =>
+      dev.createBuffer({
+        size: this.stag!.totalBytes,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      }),
+    )
+    this.stagingFlip = 0
 
     // Grid buffers embed a cap-sized entries region: particle-capacity growth
     // invalidates them too. ensureGrid rebuilds the bind groups.

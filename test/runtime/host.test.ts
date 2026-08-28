@@ -297,12 +297,10 @@ describe('SimHost', () => {
   it('commands arriving mid-step apply at the next frame boundary, never inside the frame', async () => {
     const { host, frame, last } = makeHost()
     // A deliberately slow async backend: readbacks park until released, the
-    // way a GPU frame parks the worker on its staging map. The latch frees
-    // every parked AND future readback - one tick can run several catch-up
-    // steps, each with its own readback.
+    // way a pending GPU frame parks its consumer on the staging map. The
+    // latch frees every parked AND future readback.
     let released = false
     const parked: (() => void)[] = []
-    let stepsEntered = 0
     const release = () => {
       released = true
       for (const r of parked.splice(0)) r()
@@ -310,9 +308,7 @@ describe('SimHost', () => {
     const before = host.sim.solver
     host.sim.solver = {
       sync: () => {},
-      step: () => {
-        stepsEntered++
-      },
+      step: () => {},
       readback: () =>
         released ? Promise.resolve() : new Promise<void>((res) => parked.push(res)),
     }
@@ -320,17 +316,16 @@ describe('SimHost', () => {
       for (let i = 0; i < 50; i++) await Promise.resolve()
     }
 
-    // Start a tick; it drains the unpause, then parks inside the fake
-    // readback mid-frame. (No awaited frame() before this - the fake solver
-    // parks EVERY unpaused frame until released.)
+    // Start a tick; the pipelined host CONSUMES the pending frame before it
+    // drains anything, so it parks on the fake readback with the unpause
+    // still queued behind it.
     host.enqueue({ type: 'togglePause' })
     const ticking = host.tick(100)
     await flush()
-    expect(stepsEntered).toBeGreaterThan(0)
     expect(parked.length).toBe(1)
 
-    // A command lands mid-step. If it applied now, the splash would mutate
-    // the particle store while the "GPU" owns the frame.
+    // A command lands while the "GPU" owns the frame. If it applied now,
+    // the pending results would clobber the splash when they land.
     const fluidBefore = host.sim.fluidCount
     host.enqueue({ type: 'splash', x: 0, y: host.field.terrain.heightAt(0) + 10 })
     await flush()
