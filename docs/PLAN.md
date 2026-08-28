@@ -428,7 +428,7 @@ stilt-house scene. **No timeline, no event system.**
 
 | Control | Range | Notes |
 |---|---|---|
-| **Wind** | 0–250 kph | UI in kph, sim in m/s. 250 kph ≈ 69 m/s, roughly Cat 5. |
+| **Wind** | −250–250 kph | UI in kph, sim in m/s. 250 kph ≈ 69 m/s, roughly Cat 5. Sign is the heading (+x is rightward); detent at calm, ticks every 50. |
 | **Flood** | 0–20 m target level | Water rolls in from the level edges. |
 | **Wave strength** | None → Extreme | |
 

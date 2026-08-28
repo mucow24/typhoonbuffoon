@@ -33,7 +33,7 @@ Only the outermost layer that cannot be exercised without a browser:
 Everything under `src/sim/`, `src/game/`, `src/model/`, `src/world/`,
 `src/core/`, `src/scenes/` is testable and must be tested. Geometry and
 transform *maths* is testable even when the drawing around it is not:
-`src/render/camera.ts` is NOT exempt.
+`src/render/camera.ts` and `src/ui/sliderGeometry.ts` are NOT exempt.
 
 ### Why this exists
 

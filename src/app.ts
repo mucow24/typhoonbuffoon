@@ -299,11 +299,19 @@ export class Game {
   private buildConditionsPanel(): Panel {
     const panel = new Panel({ title: 'conditions', side: 'right', width: 205 })
 
+    // Signed: the slider spans a storm blowing either way, with a detent at
+    // dead calm so the middle is reachable, and a 50 kph scale that is marks
+    // only - snapping to those would put 175 kph out of reach.
+    const windTicks: number[] = []
+    for (let v = -WIND_MAX_KPH; v <= WIND_MAX_KPH; v += 50) windTicks.push(v)
+
     new Slider(panel.body, {
       label: 'wind',
-      min: 0,
+      min: -WIND_MAX_KPH,
       max: WIND_MAX_KPH,
       step: 5,
+      ticks: windTicks,
+      detents: [0],
       value: this.conditions.windKph,
       format: (v) => `${v.toFixed(0)} kph`,
       onInput: (v) => {
