@@ -7,6 +7,7 @@ import {
   type WaveStrength,
 } from './game/conditions'
 import { Session } from './game/session'
+import { WATER_FLOW_MAX, WaterEmitter } from './game/waterEmitter'
 import { CameraController } from './input/cameraController'
 import { allIds, claimIds, defaultLevel, migrateLevel, migrateSolution } from './model/level'
 import { createRenderer, type Renderer } from './render/app'
@@ -41,6 +42,7 @@ export class Game {
   readonly conditions: Conditions
   readonly session: Session
   readonly editor: EditorController
+  readonly waterEmitter = new WaterEmitter()
 
   /** Starts paused: you build first, then run it. */
   paused = true
@@ -75,6 +77,11 @@ export class Game {
     // Build tools claim the left button, so panning is middle-drag or the
     // dedicated pan tool. Space is the play/pause key, not a pan modifier.
     this.cameraController.panWithLeft = false
+    // A click splashes even while paused, like the old dump button; the held
+    // stream ticks with the sim in fixedUpdate, so it pours only while running.
+    this.editor.onWaterSplash = (x, y) => {
+      this.waterEmitter.splash(this.sim, x, y)
+    }
     this.editorView = new EditorView(renderer.world, this.session, this.editor)
 
     this.field.onChange(() => {
@@ -220,6 +227,7 @@ export class Game {
         { value: 'object', label: 'object (3)' },
         { value: 'delete', label: 'delete (4)' },
         { value: 'pan', label: 'pan (5)' },
+        { value: 'water', label: 'water (6)' },
       ],
       onChange: (v) => {
         this.editor.tool = v
@@ -354,10 +362,19 @@ export class Game {
       },
     })
 
-    button(panel.body, 'dump water here', () => {
-      const t = this.field.terrain
-      this.sim.spawnBlock(this.camera.x, t.heightAt(this.camera.x) + 12, 10, 8)
+    new Slider(panel.body, {
+      label: 'tool flow',
+      min: 1,
+      max: WATER_FLOW_MAX,
+      step: 1,
+      value: this.waterEmitter.flow,
+      format: (v) => `${v.toFixed(0)} m²/s`,
+      onInput: (v) => {
+        this.waterEmitter.flow = v
+      },
     })
+    panel.note('water tool (6): click splashes, hold pours')
+
     button(panel.body, 'clear water', () => this.sim.clearFluid())
     button(panel.body, 'calm', () => {
       this.conditions.reset()
@@ -503,6 +520,8 @@ export class Game {
   private fixedUpdate(dt: number): void {
     if (this.paused) return
     this.conditions.update(dt)
+    const stream = this.editor.waterStream()
+    if (stream) this.waterEmitter.update(this.sim, dt, stream.x, stream.y)
     this.sim.step(dt)
     // Every frame, before any tool can act on member records: breakage frees
     // constraint slots, and the session must forget those indices before the
