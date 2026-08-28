@@ -386,6 +386,25 @@ export class Session {
     return best
   }
 
+  /**
+   * Live beam polylines per member, for the snapshot's structure view-model.
+   * Positions, never indices: this is the shape picking runs against on the
+   * far side of the worker boundary.
+   */
+  memberPolylines(): { id: string; points: number[] }[] {
+    const p = this.sim.particles
+    const out: { id: string; points: number[] }[] = []
+    for (const [id, sim] of this.memberSim) {
+      const points: number[] = []
+      for (const i of sim.nodes) {
+        if (p.slots.alive[i] !== 1) continue
+        points.push(p.posX[i]!, p.posY[i]!)
+      }
+      if (points.length >= 4) out.push({ id, points })
+    }
+    return out
+  }
+
   nodePosition(id: string): { x: number; y: number } | null {
     const i = this.nodeSim.get(id)
     if (i === undefined || this.sim.particles.slots.alive[i] !== 1) return null

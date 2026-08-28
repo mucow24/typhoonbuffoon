@@ -1,95 +1,98 @@
-import { GameLoop } from './core/loop'
-import { EditorController, type ToolName } from './editor/tools'
+import { EditorController, type EditorGateway, type ToolName } from './editor/tools'
 import {
-  Conditions,
-  FLOOD_MAX_M,
-  WIND_MAX_KPH,
-  type WaveStrength,
-} from './game/conditions'
-import { Session } from './game/session'
-import { WATER_FLOW_MAX, WaterEmitter } from './game/waterEmitter'
+  emptyStructureVM,
+  nodePosition,
+  pickAnchor,
+  pickMember,
+  pickNode,
+  pickObject,
+} from './editor/viewModel'
+import { FLOOD_MAX_M, WIND_MAX_KPH, type WaveStrength } from './game/conditions'
+import { WATER_FLOW_MAX } from './game/waterEmitter'
 import { CameraController } from './input/cameraController'
-import { allIds, claimIds, defaultLevel, migrateLevel, migrateSolution } from './model/level'
 import { createRenderer, type Renderer } from './render/app'
 import { Camera } from './render/camera'
 import { EditorView } from './render/editorView'
 import { FluidView } from './render/fluidView'
 import { Scenery } from './render/scenery'
 import { SimView } from './render/simView'
-import { buildBeam, buildLoadTest } from './scenes/demos'
-import { materialAt, type MaterialId } from './sim/materials'
-import { SimWorld } from './sim/world'
+import type { SimClient } from './runtime/client'
+import type { ProbeName, SnapshotScalars } from './runtime/protocol'
+import type { MaterialId } from './sim/materials'
 import { Choice, NumberField, Panel, Slider, button, toggle } from './ui/controls'
 import { DebugOverlay } from './ui/debug'
 import { Field } from './world/field'
 
 /**
- * Composition root. Owns the renderer, the fixed-timestep loop, the sim, and
- * the editor session.
+ * Panel initial values. The worker's classes are authoritative (Conditions,
+ * WaterEmitter, SimWorld defaults); these mirror them so the sliders start
+ * where the sim starts. Sliders are write-only - they send commands and never
+ * read back.
+ */
+const DEFAULTS = {
+  windKph: 0,
+  floodLevelM: 0,
+  waveStrength: 'none' as WaveStrength,
+  fluidSpacing: 0.25,
+  flow: 15,
+  substeps: 12,
+  linearDamping: 0.35,
+  fluidIterations: 1,
+  widthM: 120,
+}
+
+/**
+ * Main-thread composition root: renderer, camera, UI, editor - and a
+ * SimClient where the sim used to be. Everything the frame draws comes from
+ * the latest snapshot; everything the user does becomes a command. The sim
+ * itself lives in the worker (runtime/host.ts) and cannot jank the camera no
+ * matter how heavy the water gets.
  */
 export class Game {
   readonly renderer: Renderer
-  readonly loop: GameLoop
   readonly hud: DebugOverlay
   readonly camera: Camera
+  /**
+   * Main-thread terrain mirror. Terrain derives deterministically from the
+   * field width (seeded generator), so both sides regenerate the same ground
+   * from the widthM scalar instead of shipping height arrays.
+   */
   readonly field: Field
   readonly scenery: Scenery
   readonly cameraController: CameraController
-  readonly sim: SimWorld
   readonly simView: SimView
   readonly fluidView: FluidView
   readonly editorView: EditorView
-  readonly conditions: Conditions
-  readonly session: Session
   readonly editor: EditorController
-  readonly waterEmitter = new WaterEmitter()
 
-  /** Starts paused: you build first, then run it. */
-  paused = true
-  private breakCount = 0
+  private rafHandle = 0
+  private running = false
+  private lastTime = 0
+  private smoothedFrameMs = 0
   private playButton: HTMLButtonElement | null = null
   private budgetLabel: HTMLDivElement | null = null
   private toolChoice: Choice<ToolName> | null = null
 
-  private constructor(renderer: Renderer) {
+  private constructor(renderer: Renderer, readonly client: SimClient) {
     this.renderer = renderer
     this.camera = new Camera()
-    this.field = new Field(120)
+    this.field = new Field(DEFAULTS.widthM)
     this.scenery = new Scenery(renderer.world, renderer.background, this.field)
 
-    this.sim = new SimWorld()
-    this.sim.terrain = this.field.terrain
-    this.simView = new SimView(renderer.world, this.sim)
-    this.fluidView = new FluidView(renderer.world, renderer.app.renderer, this.sim)
-    this.syncBounds()
-
-    this.conditions = new Conditions(this.sim, this.field)
-    this.session = new Session(defaultLevel(this.field.widthM), this.sim, this.field)
+    this.simView = new SimView(renderer.world, client)
+    this.fluidView = new FluidView(renderer.world, renderer.app.renderer, client)
 
     this.cameraController = new CameraController(this.camera, renderer.app.canvas, renderer)
     this.editor = new EditorController(
       renderer.app.canvas,
       this.camera,
       renderer,
-      this.session,
-      this.field,
+      this.buildGateway(),
     )
     // Build tools claim the left button, so panning is middle-drag or the
     // dedicated pan tool. Space is the play/pause key, not a pan modifier.
     this.cameraController.panWithLeft = false
-    // A click splashes even while paused, like the old dump button; the held
-    // stream ticks with the sim in fixedUpdate, so it pours only while running.
-    this.editor.onWaterSplash = (x, y) => {
-      this.waterEmitter.splash(this.sim, x, y)
-    }
-    this.editorView = new EditorView(renderer.world, this.session, this.editor)
-
-    this.field.onChange(() => {
-      this.sim.terrain = this.field.terrain
-      this.syncBounds()
-      this.session.syncWidth()
-      this.session.rebuild()
-    })
+    this.editorView = new EditorView(renderer.world, client, this.editor)
 
     this.camera.fitWidth(this.field.widthM, renderer.width)
     this.camera.y = 6
@@ -99,7 +102,7 @@ export class Game {
       if ((e.target as HTMLElement)?.tagName === 'INPUT') return
       if (e.code === 'Space') {
         e.preventDefault()
-        this.togglePause()
+        this.client.send({ type: 'togglePause' })
       }
     })
 
@@ -111,100 +114,75 @@ export class Game {
     conditionsPanel.below(this.hud.panel)
     this.buildSolverPanel().below(conditionsPanel)
 
-    this.seedStarterLevel()
-
-    this.loop = new GameLoop({
-      fixedHz: 60,
-      fixedUpdate: (dt) => this.fixedUpdate(dt),
-      render: (alpha) => this.render(alpha),
-    })
-
+    const s = () => this.client.latest?.scalars ?? null
     this.hud
-      .add('frame', () => `${this.loop.stats.smoothedFrameMs.toFixed(1)} ms`)
-      .add('fps', () => `${(1000 / Math.max(this.loop.stats.smoothedFrameMs, 0.001)).toFixed(0)}`)
+      .add('frame', () => `${this.smoothedFrameMs.toFixed(1)} ms`)
+      .add('fps', () => `${(1000 / Math.max(this.smoothedFrameMs, 0.001)).toFixed(0)}`)
+      .add('sim step', () => `${(s()?.stepMs ?? 0).toFixed(1)} ms`)
       .add('state', () => {
-        if (this.paused) return 'PAUSED'
-        // The loop drops sim time rather than spiralling when a step costs
+        const sc = s()
+        if (!sc || sc.paused) return 'PAUSED'
+        // The worker drops sim time rather than spiralling when a step costs
         // more than the frame budget; say so, or heavy scenes read as broken.
-        return this.loop.stats.starved ? 'running (slow-mo)' : 'running'
+        return sc.starved ? 'running (slow-mo)' : 'running'
       })
-      .add('substeps', () => String(this.sim.substeps))
-      .add('field', () => `${this.field.widthM.toFixed(0)} m`)
-      .add('particles', () => String(this.sim.particles.count))
-      .add('water', () => String(this.sim.fluidCount))
-      .add('members', () => String(this.session.solution.members.length))
-      .add('objects', () => String(this.sim.objectCount))
-      .add('peak load', () => `${(this.peakLoad() * 100).toFixed(0)}%`)
-      .add('max damage', () => `${(this.maxDamage() * 100).toFixed(0)}%`)
-      .add('broken', () => String(this.breakCount))
-      .add('wind', () => `${(this.sim.wind.gustFactor() * this.conditions.windKph).toFixed(0)} kph`)
+      .add('substeps', () => String(s()?.substeps ?? DEFAULTS.substeps))
+      .add('field', () => `${(s()?.widthM ?? this.field.widthM).toFixed(0)} m`)
+      .add('particles', () => String(s()?.particleCount ?? 0))
+      .add('water', () => String(s()?.fluidCount ?? 0))
+      .add('members', () => String(s()?.memberCount ?? 0))
+      .add('objects', () => String(s()?.objectCount ?? 0))
+      .add('peak load', () => `${((s()?.peakLoad ?? 0) * 100).toFixed(0)}%`)
+      .add('max damage', () => `${((s()?.maxDamage ?? 0) * 100).toFixed(0)}%`)
+      .add('broken', () => String(s()?.breakCount ?? 0))
+      .add('wind', () => `${(s()?.windGustKph ?? 0).toFixed(0)} kph`)
   }
 
-  static async create(): Promise<Game> {
-    return new Game(await createRenderer())
+  static async create(client: SimClient): Promise<Game> {
+    return new Game(await createRenderer(), client)
   }
 
-  /** A couple of anchors and a house, so there is something to build onto. */
-  private seedStarterLevel(): void {
-    const t = this.field.terrain
-    const x = -8
-    const ground = t.heightAt(x)
-    this.session.addAnchor(x - 3, t.heightAt(x - 3))
-    this.session.addAnchor(x + 3, t.heightAt(x + 3))
+  // ----------------------------------------------------------------- gateway
 
-    const houseY = ground + 9
-    const houseId = this.session.addWorldObject({
-      x,
-      y: houseY,
-      width: 8,
-      height: 4.5,
-      // Light enough that a wood truss is a real option, not just steel. A
-      // 12.6t house needed 400kN members; at this weight the choice is a
-      // trade rather than a foregone conclusion.
-      density: 150,
-      label: 'house',
-    })
-    // Anchors underneath the house: build stilts to them, or watch it fall.
-    this.session.addAnchor(x - 3, houseY - 2.25, houseId)
-    this.session.addAnchor(x + 3, houseY - 2.25, houseId)
-    this.session.rebuild()
-  }
-
-  peakLoad(): number {
-    const d = this.sim.distance
-    let peak = 0
-    for (let i = 0; i < d.highWater; i++) {
-      if (d.slots.alive[i] !== 1) continue
-      if (d.unbreakable[i] === 1) continue // joinery: welds, mount links
-      const m = materialAt(d.material[i]!)
-      if (m.breakStrain <= 0) continue
-      peak = Math.max(peak, Math.abs(d.strain[i]!) / m.breakStrain)
+  /** The editor's synchronous world-view: picks answer from the latest
+   *  snapshot, mutations become commands. */
+  private buildGateway(): EditorGateway {
+    const vm = () => this.client.latest?.structure ?? emptyStructureVM()
+    const send = this.clientSend
+    return {
+      pickNode: (x, y, r) => pickNode(vm(), x, y, r),
+      pickMember: (x, y, r) => pickMember(vm(), x, y, r),
+      pickAnchor: (x, y, r) => pickAnchor(vm(), x, y, r),
+      pickObject: (x, y) => pickObject(vm(), x, y),
+      nodePosition: (id) => nodePosition(vm(), id),
+      groundHeight: (x) => this.field.terrain.heightAt(x),
+      buildMember: (fromNode, from, toNode, to, material) =>
+        send({
+          type: 'buildMember',
+          fromNode,
+          fromX: from.x,
+          fromY: from.y,
+          toNode,
+          toX: to.x,
+          toY: to.y,
+          material,
+        }),
+      addAnchor: (x, y, attachedTo) => send({ type: 'addAnchor', x, y, attachedTo }),
+      addObject: (x, y, width, height, density) =>
+        send({ type: 'addObject', x, y, width, height, density }),
+      removeMember: (id) => send({ type: 'removeMember', id }),
+      removeAnchor: (id) => send({ type: 'removeAnchor', id }),
+      removeObject: (id) => send({ type: 'removeObject', id }),
+      undo: () => send({ type: 'undo' }),
+      redo: () => send({ type: 'redo' }),
+      splash: (x, y) => send({ type: 'splash', x, y }),
+      setStream: (x, y) => send({ type: 'setStream', x, y }),
+      clearStream: () => send({ type: 'clearStream' }),
     }
-    // Bending is a failure mode too - a wall carrying hydrostatic load shows
-    // almost no axial strain, and the HUD reading 0% on a wall about to snap
-    // is the legibility failure the genre cannot afford.
-    const b = this.sim.bend
-    for (let i = 0; i < b.highWater; i++) {
-      if (b.slots.alive[i] !== 1) continue
-      const m = materialAt(b.material[i]!)
-      if (!(m.breakAngle > 0) || !Number.isFinite(m.breakAngle)) continue
-      peak = Math.max(peak, Math.abs(b.angle[i]!) / m.breakAngle)
-    }
-    return peak
   }
 
-  maxDamage(): number {
-    const d = this.sim.distance
-    let peak = 0
-    for (let i = 0; i < d.highWater; i++) {
-      if (d.slots.alive[i] === 1) peak = Math.max(peak, d.damage[i]!)
-    }
-    return peak
-  }
-
-  private syncBounds(): void {
-    this.sim.boundsX0 = this.field.left
-    this.sim.boundsX1 = this.field.right
+  private clientSend = (cmd: Parameters<SimClient['send']>[0]): void => {
+    this.client.send(cmd)
   }
 
   private fitView(): void {
@@ -260,22 +238,20 @@ export class Game {
 
     this.budgetLabel = panel.note('')
 
-    button(panel.body, 'undo (ctrl+z)', () => this.session.undo())
-    button(panel.body, 'redo (ctrl+shift+z)', () => this.session.redo())
-    button(panel.body, 'clear build', () => this.session.clearBuild())
+    button(panel.body, 'undo (ctrl+z)', () => this.client.send({ type: 'undo' }))
+    button(panel.body, 'redo (ctrl+shift+z)', () => this.client.send({ type: 'redo' }))
+    button(panel.body, 'clear build', () => this.client.send({ type: 'clearBuild' }))
 
     panel.section('session')
-    this.playButton = button(panel.body, 'play (space)', () => this.togglePause())
-    button(panel.body, 'reset to snapshot', () => {
-      this.session.reset()
-      this.breakCount = 0
-      this.setPaused(true)
-    })
+    this.playButton = button(panel.body, 'play (space)', () =>
+      this.client.send({ type: 'togglePause' }),
+    )
+    button(panel.body, 'reset to snapshot', () => this.client.send({ type: 'reset' }))
 
     panel.section('level')
-    button(panel.body, 'save level + build', () => this.saveToDisk())
+    button(panel.body, 'save level + build', () => void this.saveToDisk())
     button(panel.body, 'load level + build', () => this.loadFromDisk())
-    button(panel.body, 'clear everything', () => this.session.clearAll())
+    button(panel.body, 'clear everything', () => this.client.send({ type: 'clearAll' }))
     return panel
   }
 
@@ -289,16 +265,18 @@ export class Game {
       step: 5,
       suffix: 'm',
       onCommit: (v) => {
-        this.field.setWidth(v)
-        this.fitView()
+        // The mirror updates when the widthM scalar comes back - one code
+        // path whether the width changed here or through a loaded level.
+        this.client.send({ type: 'setFieldWidth', widthM: v })
       },
     })
     button(panel.body, 'fit view', () => this.fitView())
 
     panel.section('probe scenes')
-    button(panel.body, 'stilt house', () => this.loadProbe('stilts'))
-    button(panel.body, 'load test', () => this.loadProbe('loadtest'))
-    button(panel.body, 'palm', () => this.loadProbe('palm'))
+    const probe = (p: ProbeName) => this.client.send({ type: 'loadProbe', probe: p })
+    button(panel.body, 'stilt house', () => probe('stilts'))
+    button(panel.body, 'load test', () => probe('loadtest'))
+    button(panel.body, 'palm', () => probe('palm'))
 
     panel.note('middle-drag to pan, or the pan tool (5)')
     return panel
@@ -312,11 +290,9 @@ export class Game {
       min: 0,
       max: WIND_MAX_KPH,
       step: 5,
-      value: this.conditions.windKph,
+      value: DEFAULTS.windKph,
       format: (v) => `${v.toFixed(0)} kph`,
-      onInput: (v) => {
-        this.conditions.windKph = v
-      },
+      onInput: (v) => this.client.send({ type: 'setWind', kph: v }),
     })
 
     new Slider(panel.body, {
@@ -324,16 +300,14 @@ export class Game {
       min: 0,
       max: FLOOD_MAX_M,
       step: 0.5,
-      value: this.conditions.floodLevelM,
+      value: DEFAULTS.floodLevelM,
       format: (v) => `${v.toFixed(1)} m`,
-      onInput: (v) => {
-        this.conditions.floodLevelM = v
-      },
+      onInput: (v) => this.client.send({ type: 'setFlood', level: v }),
     })
 
     new Choice<WaveStrength>(panel.body, {
       label: 'waves',
-      value: this.conditions.waveStrength,
+      value: DEFAULTS.waveStrength,
       options: [
         { value: 'none', label: 'none' },
         { value: 'light', label: 'light' },
@@ -341,9 +315,7 @@ export class Game {
         { value: 'heavy', label: 'heavy' },
         { value: 'extreme', label: 'extreme' },
       ],
-      onChange: (v) => {
-        this.conditions.waveStrength = v
-      },
+      onChange: (v) => this.client.send({ type: 'setWaves', strength: v }),
     })
 
     panel.section('water')
@@ -352,14 +324,9 @@ export class Game {
       min: 0.15,
       max: 1.5,
       step: 0.05,
-      value: this.sim.fluid.spacing,
+      value: DEFAULTS.fluidSpacing,
       format: (v) => `${v.toFixed(2)} m`,
-      onInput: (v) => {
-        // Restamps live water to the new mass/radius - setting fluid.spacing
-        // directly left existing particles at the old mass under a solver
-        // that assumes one uniform mass.
-        this.sim.setFluidSpacing(v)
-      },
+      onInput: (v) => this.client.send({ type: 'setFluidSpacing', spacing: v }),
     })
 
     new Slider(panel.body, {
@@ -367,19 +334,14 @@ export class Game {
       min: 1,
       max: WATER_FLOW_MAX,
       step: 1,
-      value: this.waterEmitter.flow,
+      value: DEFAULTS.flow,
       format: (v) => `${v.toFixed(0)} m²/s`,
-      onInput: (v) => {
-        this.waterEmitter.flow = v
-      },
+      onInput: (v) => this.client.send({ type: 'setFlow', flow: v }),
     })
     panel.note('water tool (6): click splashes, hold pours')
 
-    button(panel.body, 'clear water', () => this.sim.clearFluid())
-    button(panel.body, 'calm', () => {
-      this.conditions.reset()
-      this.sim.clearFluid()
-    })
+    button(panel.body, 'clear water', () => this.client.send({ type: 'clearFluid' }))
+    button(panel.body, 'calm', () => this.client.send({ type: 'calm' }))
     return panel
   }
 
@@ -391,11 +353,9 @@ export class Game {
       min: 1,
       max: 32,
       step: 1,
-      value: this.sim.substeps,
+      value: DEFAULTS.substeps,
       format: (v) => v.toFixed(0),
-      onInput: (v) => {
-        this.sim.substeps = v
-      },
+      onInput: (v) => this.client.send({ type: 'setSubsteps', substeps: v }),
     })
 
     new Slider(panel.body, {
@@ -403,11 +363,9 @@ export class Game {
       min: 0,
       max: 2,
       step: 0.05,
-      value: this.sim.linearDamping,
+      value: DEFAULTS.linearDamping,
       format: (v) => `${v.toFixed(2)}/s`,
-      onInput: (v) => {
-        this.sim.linearDamping = v
-      },
+      onInput: (v) => this.client.send({ type: 'setLinearDamping', value: v }),
     })
 
     new Slider(panel.body, {
@@ -415,11 +373,9 @@ export class Game {
       min: 1,
       max: 6,
       step: 1,
-      value: this.sim.fluid.iterations,
+      value: DEFAULTS.fluidIterations,
       format: (v) => v.toFixed(0),
-      onInput: (v) => {
-        this.sim.fluid.iterations = v
-      },
+      onInput: (v) => this.client.send({ type: 'setFluidIterations', iterations: v }),
     })
 
     toggle(panel.body, 'stress colours', this.simView.showStress, (v) => {
@@ -431,46 +387,16 @@ export class Game {
     return panel
   }
 
-  // ------------------------------------------------------------------ probes
-
-  private loadProbe(which: 'stilts' | 'loadtest' | 'palm'): void {
-    this.session.clearAll()
-    this.conditions.reset()
-    this.sim.clearFluid()
-    const t = this.field.terrain
-    const x = -8
-
-    if (which === 'stilts') {
-      this.seedStarterLevel()
-      return
-    }
-    if (which === 'loadtest') {
-      buildLoadTest(this.sim, { x, y: t.heightAt(x) + 14, material: 'wood', tipMassKg: 8000 })
-      return
-    }
-    buildBeam(this.sim, {
-      x0: x,
-      y0: t.heightAt(x),
-      x1: x,
-      y1: t.heightAt(x) + 13,
-      material: 'wood',
-      clampStart: true,
-    })
-  }
-
   // ------------------------------------------------------------ save / load
 
-  private saveToDisk(): void {
-    const payload = JSON.stringify(
-      { level: this.session.doc, solution: this.session.solution },
-      null,
-      2,
-    )
+  private async saveToDisk(): Promise<void> {
+    const data = await this.client.save()
+    const payload = JSON.stringify({ level: data.level, solution: data.solution }, null, 2)
     const blob = new Blob([payload], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${this.session.doc.name || 'level'}.json`
+    a.download = `${data.level.name || 'level'}.json`
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -484,13 +410,7 @@ export class Game {
       if (!file) return
       try {
         const parsed = JSON.parse(await file.text()) as { level?: unknown; solution?: unknown }
-        this.session.doc = migrateLevel(parsed.level)
-        this.session.solution = migrateSolution(parsed.solution)
-        // The id counter restarts at zero each page load; without claiming
-        // the loaded ids, the next placed anchor collides with a saved one.
-        claimIds(allIds(this.session.doc, this.session.solution))
-        this.field.setWidth(this.session.doc.widthM)
-        this.session.rebuild()
+        await this.client.load(parsed.level, parsed.solution)
         this.fitView()
       } catch (err) {
         console.error('failed to load level', err)
@@ -501,75 +421,68 @@ export class Game {
 
   // -------------------------------------------------------------- loop hooks
 
-  /**
-   * Pause freezes the simulation only. Rendering, the camera and every build
-   * tool keep working, because building while paused is the normal way to lay
-   * a structure out - gravity yanking each piece the moment you place it is not
-   * a useful editor.
-   */
-  setPaused(paused: boolean): void {
-    this.paused = paused
-  }
+  private tick = (now: number): void => {
+    if (!this.running) return
+    this.rafHandle = requestAnimationFrame(this.tick)
 
-  togglePause(): void {
-    // First unpause doubles as Play: take the snapshot Reset restores to.
-    if (this.paused && !this.session.running) this.session.play()
-    this.paused = !this.paused
-  }
+    const frameMs = this.lastTime === 0 ? 1000 / 60 : now - this.lastTime
+    this.lastTime = now
+    this.smoothedFrameMs =
+      this.smoothedFrameMs === 0 ? frameMs : this.smoothedFrameMs * 0.9 + frameMs * 0.1
 
-  private fixedUpdate(dt: number): void {
-    if (this.paused) return
-    this.conditions.update(dt)
-    const stream = this.editor.waterStream()
-    if (stream) this.waterEmitter.update(this.sim, dt, stream.x, stream.y)
-    this.sim.step(dt)
-    // Every frame, before any tool can act on member records: breakage frees
-    // constraint slots, and the session must forget those indices before the
-    // free list recycles them into someone else's constraints.
-    this.session.syncBreaks()
-    if (this.sim.breakEvents.length > 0) {
-      this.breakCount += this.sim.breakEvents.length
-      this.sim.breakEvents.length = 0
-    }
-  }
+    const scalars = this.client.latest?.scalars ?? null
+    if (scalars) this.syncFromScalars(scalars)
 
-  private render(_alpha: number): void {
-    this.scenery.setSeverity(this.conditions.severity())
     this.scenery.update(this.camera, this.renderer.width, this.renderer.height)
     this.simView.update(this.camera, this.renderer.width, this.renderer.height)
     this.fluidView.update(this.camera, this.renderer.width, this.renderer.height)
     this.editorView.update(this.camera, this.renderer.width, this.renderer.height)
     this.renderer.app.render()
     this.hud.update()
-    this.updateBudgetLabel()
+
     if (this.toolChoice) this.toolChoice.set(this.editor.tool)
-    if (this.playButton) {
-      const label = this.paused ? 'play (space)' : 'pause (space)'
-      if (this.playButton.textContent !== label) this.playButton.textContent = label
-    }
   }
 
-  private updateBudgetLabel(): void {
-    if (!this.budgetLabel) return
-    const cost = this.session.cost()
-    const remaining = this.session.doc.budget - cost
-    const text = `spent $${cost.toFixed(0)} / $${this.session.doc.budget.toFixed(0)}`
-    if (this.budgetLabel.textContent !== text) {
-      this.budgetLabel.textContent = text
-      this.budgetLabel.style.color = remaining < 0 ? '#e2483c' : 'var(--text-dim)'
+  private syncFromScalars(scalars: SnapshotScalars): void {
+    // The width scalar is authoritative: a typed width and a loaded level
+    // both come back through here, regenerating the same deterministic
+    // terrain the worker regenerated.
+    if (scalars.widthM !== this.field.widthM) {
+      this.field.setWidth(scalars.widthM)
+      this.fitView()
+    }
+
+    this.scenery.setSeverity(scalars.severity)
+
+    if (this.playButton) {
+      const label = scalars.paused ? 'play (space)' : 'pause (space)'
+      if (this.playButton.textContent !== label) this.playButton.textContent = label
+    }
+    if (this.budgetLabel) {
+      const remaining = scalars.budget - scalars.cost
+      const text = `spent $${scalars.cost.toFixed(0)} / $${scalars.budget.toFixed(0)}`
+      if (this.budgetLabel.textContent !== text) {
+        this.budgetLabel.textContent = text
+        this.budgetLabel.style.color = remaining < 0 ? '#e2483c' : 'var(--text-dim)'
+      }
     }
   }
 
   start(): void {
-    this.loop.start()
+    if (this.running) return
+    this.running = true
+    this.lastTime = 0
+    this.rafHandle = requestAnimationFrame(this.tick)
   }
 
   stop(): void {
-    this.loop.stop()
+    this.running = false
+    if (this.rafHandle) cancelAnimationFrame(this.rafHandle)
+    this.rafHandle = 0
   }
 
-  /** Advance the sim synchronously, for headless verification. */
-  pump(steps = 1): void {
-    for (let i = 0; i < steps; i++) this.loop.step()
+  /** Advance the sim synchronously in the worker, for headless verification. */
+  pump(steps = 1): Promise<void> {
+    return this.client.pump(steps)
   }
 }

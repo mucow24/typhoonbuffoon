@@ -1,4 +1,4 @@
-export interface LoopStats {
+export interface StepperStats {
   /** Wall-clock ms for the last frame (raw). */
   frameMs: number
   /** Smoothed frame time, for a readable HUD. */
@@ -9,11 +9,11 @@ export interface LoopStats {
   totalSteps: number
   /** Seconds of simulated time elapsed. */
   simTime: number
-  /** True when the loop had to drop simulated time to keep up. */
+  /** True when the stepper had to drop simulated time to keep up. */
   starved: boolean
 }
 
-export interface LoopOptions {
+export interface StepperOptions {
   /** Fixed simulation rate. 60 Hz unless there is a reason. */
   fixedHz?: number
   /**
@@ -34,28 +34,36 @@ export interface LoopOptions {
    */
   maxCatchUpSteps?: number
   fixedUpdate(dt: number): void
-  /** `alpha` is the 0..1 interpolation factor between the last two fixed states. */
-  render(alpha: number, stats: Readonly<LoopStats>): void
+  /**
+   * Called once per advance(), after the frame's steps. `alpha` is the 0..1
+   * interpolation factor between the last two fixed states. In the worker this
+   * is where the snapshot is built and posted.
+   */
+  frameEnd(alpha: number, stats: Readonly<StepperStats>): void
 }
 
 /**
- * Fixed-timestep loop with an accumulator and decoupled render interpolation.
- * The sim never sees a variable dt - stability rule 1 in docs/PLAN.md is "add
- * substeps, never grow dt", and that only holds if dt is genuinely fixed.
+ * Fixed-timestep accumulator. The sim never sees a variable dt - stability
+ * rule 1 in docs/PLAN.md is "add substeps, never grow dt", and that only holds
+ * if dt is genuinely fixed.
+ *
+ * Deliberately free of any scheduler: the sim worker drives advance() from a
+ * timer, tests drive it with synthetic clocks, and step() runs one fixed step
+ * synchronously for headless verification. (Its rAF-driven ancestor lived on
+ * the main thread as core/loop.ts until the sim moved behind the worker
+ * boundary - docs/GPU_PLAN.md.)
  */
-export class GameLoop {
+export class FixedStepper {
   readonly fixedDt: number
   private readonly maxFrameMs: number
   private readonly maxCatchUpSteps: number
   private readonly fixedUpdate: (dt: number) => void
-  private readonly renderFn: (alpha: number, stats: Readonly<LoopStats>) => void
+  private readonly frameEnd: (alpha: number, stats: Readonly<StepperStats>) => void
 
   private accumulator = 0
   private lastTime = 0
-  private rafHandle = 0
-  private running = false
 
-  readonly stats: LoopStats = {
+  readonly stats: StepperStats = {
     frameMs: 0,
     smoothedFrameMs: 0,
     stepsLastFrame: 0,
@@ -64,35 +72,22 @@ export class GameLoop {
     starved: false,
   }
 
-  constructor(opts: LoopOptions) {
+  constructor(opts: StepperOptions) {
     this.fixedDt = 1 / (opts.fixedHz ?? 60)
     this.maxFrameMs = opts.maxFrameMs ?? 250
     this.maxCatchUpSteps = Math.max(1, opts.maxCatchUpSteps ?? 3)
     this.fixedUpdate = opts.fixedUpdate
-    this.renderFn = opts.render
+    this.frameEnd = opts.frameEnd
   }
 
   /**
-   * Run exactly one fixed step outside requestAnimationFrame. Used for headless
-   * verification, where the browser pane may not be compositing at all.
+   * Run exactly one fixed step outside the accumulator. Used for headless
+   * verification (the pump command), where no wall clock is involved.
    */
   step(): void {
     this.fixedUpdate(this.fixedDt)
     this.stats.simTime += this.fixedDt
     this.stats.totalSteps++
-  }
-
-  start(): void {
-    if (this.running) return
-    this.running = true
-    this.beginFrames(performance.now())
-    this.rafHandle = requestAnimationFrame(this.tick)
-  }
-
-  stop(): void {
-    this.running = false
-    if (this.rafHandle) cancelAnimationFrame(this.rafHandle)
-    this.rafHandle = 0
   }
 
   /** Reset frame timing so the next advance() measures from `now`. */
@@ -102,10 +97,9 @@ export class GameLoop {
   }
 
   /**
-   * One frame's worth of work at wall-clock time `now` (ms). Extracted from
-   * the rAF callback so the loop's overload behaviour is testable - the
-   * accumulator maths is exactly the kind of logic that quietly turns "a bit
-   * over budget" into "frozen for many seconds".
+   * One frame's worth of work at wall-clock time `now` (ms). The accumulator
+   * maths is exactly the kind of logic that quietly turns "a bit over budget"
+   * into "frozen for many seconds", which is why it is testable in isolation.
    */
   advance(now: number): void {
     let frameMs = now - this.lastTime
@@ -137,12 +131,6 @@ export class GameLoop {
     this.stats.stepsLastFrame = steps
     this.stats.starved = starved
 
-    this.renderFn(this.accumulator / this.fixedDt, this.stats)
-  }
-
-  private tick = (now: number): void => {
-    if (!this.running) return
-    this.rafHandle = requestAnimationFrame(this.tick)
-    this.advance(now)
+    this.frameEnd(this.accumulator / this.fixedDt, this.stats)
   }
 }

@@ -29,11 +29,15 @@ Only the outermost layer that cannot be exercised without a browser:
 | `src/ui/*` | DOM panel construction. |
 | `src/input/*`, `src/editor/tools.ts` | Pointer and key event plumbing. |
 | `src/main.ts`, `src/app.ts` | Composition root and wiring. |
+| `src/runtime/worker.ts` | The Worker global shell: wires `self` to SimHost, nothing else may live here. |
 
 Everything under `src/sim/`, `src/game/`, `src/model/`, `src/world/`,
-`src/core/`, `src/scenes/` is testable and must be tested. Geometry and
-transform *maths* is testable even when the drawing around it is not:
-`src/render/camera.ts` is NOT exempt.
+`src/core/`, `src/scenes/` is testable and must be tested. So is the worker
+boundary: `src/runtime/host.ts`, `client.ts`, `snapshot.ts`, and
+`src/editor/viewModel.ts` are plain classes and pure functions, tested in
+Node over a loopback wire (`test/runtime/`) - only the five-line worker
+shell is exempt. Geometry and transform *maths* is testable even when the
+drawing around it is not: `src/render/camera.ts` is NOT exempt.
 
 ### Why this exists
 

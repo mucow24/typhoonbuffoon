@@ -2,7 +2,8 @@ import { Container, Graphics } from 'pixi.js'
 import { clamp, lerp } from '../core/math'
 import { materialAt } from '../sim/materials'
 import { KIND_NODE } from '../sim/particles'
-import type { SimWorld } from '../sim/world'
+import { FLAG_ALIVE, FLAG_PINNED, kindOfFlags } from '../runtime/snapshot'
+import type { SimClient } from '../runtime/client'
 import type { Camera } from './camera'
 
 const mixRgb = (a: number, b: number, t: number): number => {
@@ -38,6 +39,12 @@ export function stressColour(base: number, load: number, damage: number): number
   return mixRgb(hot, DAMAGE_DARK, clamp(damage, 0, 1) * 0.55)
 }
 
+/**
+ * Structure rendering from snapshots: member segments arrive with world
+ * endpoints, stress and material already resolved worker-side; clusters as
+ * fitted frames; structure nodes from the particle block (interpolated
+ * between the last two snapshots, like the fluid).
+ */
 export class SimView {
   readonly container = new Container()
   private readonly g = new Graphics()
@@ -47,7 +54,7 @@ export class SimView {
 
   constructor(
     parent: Container,
-    private readonly sim: SimWorld,
+    private readonly client: SimClient,
   ) {
     this.container.addChild(this.g)
     parent.addChild(this.container)
@@ -60,59 +67,64 @@ export class SimView {
 
   private draw(): void {
     const g = this.g
-    const p = this.sim.particles
-    const d = this.sim.distance
     g.clear()
+    const snap = this.client.latest
+    if (!snap) return
+    const body = snap.body
 
-    const alive = d.slots.alive
-    for (let i = 0; i < d.highWater; i++) {
-      if (alive[i] !== 1) continue
-      const ia = d.a[i]!
-      const ib = d.b[i]!
-      const mat = materialAt(d.material[i]!)
-      const load = mat.breakStrain > 0 ? Math.abs(d.strain[i]!) / mat.breakStrain : 0
+    for (let k = 0; k < body.segmentCount; k++) {
+      const mat = materialAt(body.segMaterial[k]!)
+      const load = mat.breakStrain > 0 ? Math.abs(body.segStrain[k]!) / mat.breakStrain : 0
       const colour = this.showStress
-        ? stressColour(mat.colour, load, d.damage[i]!)
+        ? stressColour(mat.colour, load, body.segDamage[k]!)
         : mat.colour
 
-      g.moveTo(p.posX[ia]!, p.posY[ia]!)
-      g.lineTo(p.posX[ib]!, p.posY[ib]!)
+      g.moveTo(body.segAx[k]!, body.segAy[k]!)
+      g.lineTo(body.segBx[k]!, body.segBy[k]!)
       g.stroke({ width: mat.section, color: colour, cap: 'round' })
     }
 
     // Physics objects: shape-matched clusters, drawn from their best-fit frame
     // rather than from the particles, so they read as solid things.
-    for (const c of this.sim.clusters) {
-      if (!c.alive) continue
-      const { hw, hh } = c.restExtent()
+    for (const c of snap.clusters) {
       const cos = Math.cos(c.angle)
       const sin = Math.sin(c.angle)
       const corners = [
-        [-hw, -hh],
-        [hw, -hh],
-        [hw, hh],
-        [-hw, hh],
+        [-c.hw, -c.hh],
+        [c.hw, -c.hh],
+        [c.hw, c.hh],
+        [-c.hw, c.hh],
       ]
       const pts: number[] = []
       for (const [lx, ly] of corners) {
         pts.push(c.cx + cos * lx! - sin * ly!, c.cy + sin * lx! + cos * ly!)
       }
-      const density = c.totalMass / Math.max(4 * hw * hh, 1e-6)
-      const colour = density < 1000 ? 0xc99a5b : 0x8792a0
+      const colour = c.light ? 0xc99a5b : 0x8792a0
       g.poly(pts).fill(colour)
       g.poly(pts).stroke({ width: 0.08, color: 0x2f3944, alpha: 0.7 })
     }
 
     if (!this.showNodes) return
-    const palive = p.slots.alive
-    for (let i = 0; i < p.highWater; i++) {
-      if (palive[i] !== 1) continue
-      // Structure nodes only. This used to draw a circle for EVERY particle,
-      // including thousands of fluid particles the fluid renderer had already
-      // drawn - 13.75ms a frame of pure redundancy at 6k particles.
-      if (p.kind[i] !== KIND_NODE) continue
-      const pinned = p.invMass[i] === 0
-      g.circle(p.posX[i]!, p.posY[i]!, pinned ? 0.26 : 0.13)
+    const prev = this.client.previous?.body ?? null
+    const alpha = this.client.renderAlpha()
+    const nBoth = prev ? Math.min(body.particleCount, prev.particleCount) : 0
+    for (let i = 0; i < body.particleCount; i++) {
+      const flags = body.flags[i]!
+      if ((flags & FLAG_ALIVE) === 0 || kindOfFlags(flags) !== KIND_NODE) continue
+      let x = body.posX[i]!
+      let y = body.posY[i]!
+      if (prev && i < nBoth && prev.flags[i] === flags) {
+        const px = prev.posX[i]!
+        const py = prev.posY[i]!
+        // A recycled slot can hold a different particle in the two snapshots;
+        // a long lerp streak across the field gives it away. Snap instead.
+        if ((px - x) * (px - x) + (py - y) * (py - y) < 4) {
+          x = px + (x - px) * alpha
+          y = py + (y - py) * alpha
+        }
+      }
+      const pinned = (flags & FLAG_PINNED) !== 0
+      g.circle(x, y, pinned ? 0.26 : 0.13)
       g.fill(pinned ? 0xff9d5c : 0x2f3944)
     }
   }
