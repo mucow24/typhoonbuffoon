@@ -227,6 +227,10 @@ export class SimWorld {
       : () => {}
 
     this.ensureTerrainBoundary()
+    // The hash built this step sees every live particle, so the recent-spawn
+    // list has done its job and hands occupancy checks back to hasFluidNear.
+    this.recentSpawnX.length = 0
+    this.recentSpawnY.length = 0
     mark()
     const h = dt / this.substeps
     this.water.build(
@@ -1431,11 +1435,72 @@ export class SimWorld {
     return spawned
   }
 
+  /**
+   * Spawns made since the last step(), checked by spawnDisc in addition to
+   * the spatial hash. hasFluidNear reads the hash built during step(), so a
+   * spawn made while the sim is paused is invisible to it - a second splash
+   * at the same spot would stack particles exactly on top of the first, and
+   * that density error discharges at the speed cap on unpause.
+   */
+  private readonly recentSpawnX: number[] = []
+  private readonly recentSpawnY: number[] = []
+
+  private nearRecentSpawn(x: number, y: number, radius: number): boolean {
+    const r2 = radius * radius
+    for (let i = 0; i < this.recentSpawnX.length; i++) {
+      const dx = this.recentSpawnX[i]! - x
+      const dy = this.recentSpawnY[i]! - y
+      if (dx * dx + dy * dy < r2) return true
+    }
+    return false
+  }
+
+  /**
+   * Spawn water in a disc, for the water tool. Same guards as spawnBlock,
+   * plus the recent-spawn list, so repeated calls between steps - splashing
+   * while paused, or a stream emitting several particles per frame - never
+   * double-fill space the stale hash reports as empty.
+   */
+  spawnDisc(cx: number, cy: number, radius: number, maxParticles = 40000): number {
+    const spacing = this.fluid.spacing
+    const p = this.particles
+    const t = this.terrain
+    const r2 = radius * radius
+    const clearance = spacing * 0.85
+    let spawned = 0
+    for (let x = cx - radius; x <= cx + radius && spawned < maxParticles; x += spacing) {
+      const ground = t ? t.heightAt(x) : -Infinity
+      for (let y = cy - radius; y <= cy + radius && spawned < maxParticles; y += spacing) {
+        const dx = x - cx
+        const dy = y - cy
+        if (dx * dx + dy * dy > r2) continue
+        if (y < ground + spacing) continue
+        if (this.hasFluidNear(x, y, clearance)) continue
+        if (this.nearRecentSpawn(x, y, clearance)) continue
+        const px = x + (this.jitter.next() - 0.5) * spacing * 0.25
+        const py = y + (this.jitter.next() - 0.5) * spacing * 0.25
+        p.create({
+          x: px,
+          y: py,
+          invMass: 1 / this.fluid.particleMass,
+          radius: spacing * 0.5,
+          kind: KIND_FLUID,
+        })
+        this.recentSpawnX.push(px)
+        this.recentSpawnY.push(py)
+        spawned++
+      }
+    }
+    return spawned
+  }
+
   clearFluid(): void {
     const p = this.particles
     for (let i = 0; i < p.highWater; i++) {
       if (p.slots.alive[i] === 1 && p.kind[i] === KIND_FLUID) p.destroy(i)
     }
+    this.recentSpawnX.length = 0
+    this.recentSpawnY.length = 0
   }
 
   /**

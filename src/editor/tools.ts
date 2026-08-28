@@ -4,7 +4,7 @@ import type { MaterialId } from '../sim/materials'
 import type { Field } from '../world/field'
 import type { Vec2 } from '../core/math'
 
-export type ToolName = 'pan' | 'build' | 'anchor' | 'object' | 'delete'
+export type ToolName = 'pan' | 'build' | 'anchor' | 'object' | 'delete' | 'water'
 
 export interface EditorPreview {
   kind: 'none' | 'member' | 'object'
@@ -43,6 +43,11 @@ export class EditorController {
 
   hoverNode: string | null = null
   hoverMember: string | null = null
+
+  /** Fired on water-tool click; the splash works even while paused. */
+  onWaterSplash: ((x: number, y: number) => void) | null = null
+  private waterHeld = false
+  private readonly waterPos: Vec2 = { x: 0, y: 0 }
 
   private dragging = false
   private dragFrom: Vec2 = { x: 0, y: 0 }
@@ -136,6 +141,14 @@ export class EditorController {
         break
       }
 
+      case 'water': {
+        this.waterHeld = true
+        this.waterPos.x = world.x
+        this.waterPos.y = world.y
+        this.onWaterSplash?.(world.x, world.y)
+        break
+      }
+
       case 'delete': {
         // Most specific first: a member is a thin target, an object a large
         // one, so picking the object first would make members unclickable.
@@ -171,6 +184,11 @@ export class EditorController {
     this.hoverNode = this.session.pickNode(world.x, world.y, snap)
     this.hoverMember = this.tool === 'delete' ? this.session.pickMember(world.x, world.y, snap) : null
 
+    if (this.waterHeld) {
+      this.waterPos.x = world.x
+      this.waterPos.y = world.y
+    }
+
     if (!this.dragging) return
 
     if (this.preview.kind === 'member') {
@@ -189,7 +207,13 @@ export class EditorController {
     }
   }
 
+  /** Cursor position to stream water at while the water tool is held down. */
+  waterStream(): Vec2 | null {
+    return this.tool === 'water' && this.waterHeld ? this.waterPos : null
+  }
+
   private onUp = (e: PointerEvent): void => {
+    if (e.button === 0) this.waterHeld = false
     if (e.button !== 0 || !this.dragging) return
     this.dragging = false
 
@@ -239,6 +263,9 @@ export class EditorController {
         break
       case '5':
         this.tool = 'pan'
+        break
+      case '6':
+        this.tool = 'water'
         break
       case 'q':
         this.material = 'wood'
