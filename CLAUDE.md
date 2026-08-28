@@ -74,8 +74,15 @@ confidence.
 
 ```
 npm run dev        # vite dev server
-npm test           # vitest, watch
-npm run test:run   # vitest, single pass
+npm test           # vitest watch, unit project (Node, CPU reference)
+npm run test:run   # unit project, single pass
+npm run test:gpu   # GPU project: WebGPU kernel/parity/throughput, real browser
+npm run test:all   # both projects
 npm run typecheck  # tsc --noEmit
 npm run build      # typecheck + production build
 ```
+
+The GPU project needs a WebGPU-capable machine and fails loudly (never
+skips) without one. Run it whenever `src/sim/gpu/**`, the solver seam, or
+anything the parity scenes exercise changes; the unit project alone cannot
+see a broken kernel.

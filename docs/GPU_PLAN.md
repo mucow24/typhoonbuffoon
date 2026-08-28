@@ -9,6 +9,37 @@ This document is the architecture and the execution plan. It supersedes the
 "main thread to start" line of `docs/PLAN.md` §5.1; nothing else in PLAN.md
 changes.
 
+## Status: SHIPPED (2026-08-28) - P1-P4 landed on this branch
+
+Measured on the Intel UHD (gen-12lp) adapter, the hardware floor the goal
+was stated against: **40.5k fluid particles at 16.4-17.4 ms/frame (median
+~16.7 = 60 Hz)**; the game's own beach scene runs 22.6k fluid at 10.3 ms.
+The CPU reference needs ~156 ms for the 40k scene. The wall number includes
+host passes, full state upload, encoding, submission and the readback stall
+(~3.5 ms of it - recoverable later by pipelining the readback one frame
+behind, at the cost of frame-lagged host logic; not needed to hit the goal).
+
+What shipped matches this plan with three notable learnings:
+
+- The dense ROW-MAJOR grid (not the CPU's hashed table) was the decisive
+  optimisation: sorted entries become spatially ordered, a cell ring is
+  three contiguous runs, and the gather kernels go from latency-bound to
+  under budget. Optimisation history with per-step bisect numbers lives in
+  the P3 commit message.
+- Chromium's headless SHELL has no GPU adapter, and Playwright injects
+  --disable-gpu into headless launches; the test rig runs full Chromium
+  with that flag stripped (vitest.config.ts documents it).
+- A HIDDEN tab runs ~3.5x slower - Chrome deprioritises background GPU
+  work. That is the environment, not the solver; visible tabs run at bench
+  speed, hidden ones slow-mo gracefully under the stepper's drop-debt
+  contract.
+
+Deferred, deliberately: readback pipelining (above); GPU-direct rendering
+(Pixi stays on WebGL reading snapshots); a member-segment grid for capsule
+contacts if member counts ever reach the thousands (the whole-structure
+AABB early-out covers current content); the spawnDisc jitter-order fix
+(pre-existing, tracked separately).
+
 ## Where the time goes today (measured, 2026-08-28, i9-14900HX)
 
 Per-pass profile of `SimWorld.step` (fluid only, spacing 0.25, 12 substeps),
