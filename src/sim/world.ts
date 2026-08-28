@@ -1420,11 +1420,15 @@ export class SimWorld {
         // Never spawn into occupied space - same rule as the flood inflow, for
         // the same reason: an overlapped pair is a density error the solver
         // can only answer with a violent correction. Dumping water onto water
-        // fills the gaps and skips the rest.
-        if (this.hasFluidNear(x, y, spacing * 0.85)) continue
+        // fills the gaps and skips the rest. Guard the jittered candidate,
+        // not the grid point: the clearance has to hold for the position the
+        // particle actually gets.
+        const px = x + (this.jitter.next() - 0.5) * spacing * 0.25
+        const py = y + (this.jitter.next() - 0.5) * spacing * 0.25
+        if (this.hasFluidNear(px, py, spacing * 0.85)) continue
         p.create({
-          x: x + (this.jitter.next() - 0.5) * spacing * 0.25,
-          y: y + (this.jitter.next() - 0.5) * spacing * 0.25,
+          x: px,
+          y: py,
           invMass: 1 / this.fluid.particleMass,
           radius: spacing * 0.5,
           kind: KIND_FLUID,
@@ -1466,7 +1470,19 @@ export class SimWorld {
     const p = this.particles
     const t = this.terrain
     const r2 = radius * radius
-    const clearance = spacing * 0.85
+    // Two clearances, because the two guards see different data. The hash
+    // is a frame stale and its water is in motion, so precision against it
+    // is illusory; 0.85 * spacing keeps streams and gap-filling at the
+    // throughput the flow slider promises, and the odd close pair resolves
+    // inside the splash dynamics that created it. The recent-spawn list is
+    // EXACT - spawns made this frame or while paused, unmoved - and there a
+    // pair admitted at 0.85 * spacing reads ~7% OVER rest density (poly6 is
+    // steep at close range), which the solve discharges at the correction
+    // cap: a paused splash fizzed upward at 8-9 m/s on unpause. At
+    // 0.95 * spacing the whole jittered burst is sub-rest-density (measured
+    // max C of -13%), gets no pressure support, and simply falls.
+    const hashClearance = spacing * 0.85
+    const burstClearance = spacing * 0.95
     let spawned = 0
     for (let x = cx - radius; x <= cx + radius && spawned < maxParticles; x += spacing) {
       const ground = t ? t.heightAt(x) : -Infinity
@@ -1475,10 +1491,15 @@ export class SimWorld {
         const dy = y - cy
         if (dx * dx + dy * dy > r2) continue
         if (y < ground + spacing) continue
-        if (this.hasFluidNear(x, y, clearance)) continue
-        if (this.nearRecentSpawn(x, y, clearance)) continue
+        // The guards must see the JITTERED candidate, not the grid point:
+        // clearance only matters between positions particles actually get,
+        // and guarding the grid point admits pairs whose jitters pull
+        // together to ~0.75 * spacing, well into the over-density regime the
+        // clearance exists to exclude.
         const px = x + (this.jitter.next() - 0.5) * spacing * 0.25
         const py = y + (this.jitter.next() - 0.5) * spacing * 0.25
+        if (this.hasFluidNear(px, py, hashClearance)) continue
+        if (this.nearRecentSpawn(px, py, burstClearance)) continue
         p.create({
           x: px,
           y: py,

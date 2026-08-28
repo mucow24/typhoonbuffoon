@@ -9,6 +9,7 @@ import {
   expectSpeedBelow,
   fillWater,
   makeWorld,
+  maxSpeed,
   run,
   settle,
 } from '../harness'
@@ -20,6 +21,25 @@ import {
  */
 
 const fluid = (sim: SimWorld) => sim.particles.countOfKind(KIND_FLUID)
+
+/** Closest fluid pair, brute force - the spacing the guards actually produced. */
+function minPairDistance(sim: SimWorld): number {
+  const p = sim.particles
+  const idx: number[] = []
+  for (let i = 0; i < p.highWater; i++) {
+    if (p.slots.alive[i] === 1 && p.kind[i] === KIND_FLUID) idx.push(i)
+  }
+  let min = Infinity
+  for (let a = 0; a < idx.length; a++) {
+    for (let b = a + 1; b < idx.length; b++) {
+      const i = idx[a]!
+      const j = idx[b]!
+      const d = Math.hypot(p.posX[i]! - p.posX[j]!, p.posY[i]! - p.posY[j]!)
+      if (d < min) min = d
+    }
+  }
+  return min
+}
 
 describe('spawnDisc', () => {
   it('spawns inside the disc and never below the terrain', () => {
@@ -57,13 +77,17 @@ describe('spawnDisc', () => {
   it('repeated calls between steps stack nothing (splashing while paused)', () => {
     // hasFluidNear reads the hash built during step(). Without the
     // recent-spawn guard, every splash made while paused lands exactly on the
-    // previous one, and the density error detonates on unpause.
+    // previous one, and the density error detonates on unpause. A repeat
+    // call may still admit a few particles into genuine gaps the first
+    // call's jitter left open - what it must never do is put anything
+    // inside the clearance of an earlier spawn.
     const sim = makeWorld({ widthM: 30, spacing: 0.4, floor: 0 })
     const first = sim.spawnDisc(0, 2, 1.5)
     expect(first).toBeGreaterThan(10)
 
     const again = sim.spawnDisc(0, 2, 1.5)
-    expect(again).toBe(0)
+    expect(again).toBeLessThan(first * 0.15)
+    expect(minPairDistance(sim)).toBeGreaterThanOrEqual(0.4 * 0.95 * 0.999)
 
     // After a step the hash sees the spawns and takes over the guard.
     sim.step(1 / 60)
@@ -129,6 +153,33 @@ describe('WaterEmitter', () => {
     // three seconds the pool refused.
     const burst = em.update(sim, 1 / 60, 0, 30)
     expect(burst).toBeLessThanOrEqual(Math.ceil(12 / 60 / (0.4 * 0.4)) + 1)
+  })
+
+  it('a paused splash respects the spawn clearance and does not fizz on unpause', () => {
+    // A click while paused spawns the whole burst with no steps in between,
+    // so nothing relaxes the lattice before it is complete. The clearance
+    // must hold for the positions particles ACTUALLY get, and it must be
+    // wide enough that a jittered burst spawns sub-rest-density: guarding
+    // the unjittered grid point admitted pairs down to ~0.77 * spacing, and
+    // even at 0.85 the worst particle reads ~7% OVER rest density - poly6 is
+    // steep at close range - which the solve discharges at the correction
+    // cap. Both versions fizzed upward at 8-9 m/s on unpause.
+    const sim = makeWorld({ widthM: 30, spacing: 0.25, floor: 0 })
+    const em = new WaterEmitter() // default flow: an 84-particle burst
+    const n = em.splash(sim, 0, 6)
+    expect(n).toBeGreaterThan(50)
+
+    // The guard's contract, checked against actual positions: no pair
+    // closer than the sub-rest-density clearance.
+    expect(minPairDistance(sim)).toBeGreaterThanOrEqual(0.25 * 0.95 * 0.999)
+
+    // Unpause. In free fall the blob reaches g * dt ~ 0.16 m/s after one
+    // step, ~1 m/s after six. The over-density discharge saturates the
+    // 8 m/s correction cap; 3 m/s separates the regimes cleanly.
+    for (let step = 1; step <= 6; step++) {
+      sim.step(1 / 60)
+      expect(maxSpeed(sim, KIND_FLUID), `max fluid speed after step ${step}`).toBeLessThan(3)
+    }
   })
 
   it('a click splash is one flow-sized burst', () => {
