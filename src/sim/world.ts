@@ -46,8 +46,10 @@ export class SimWorld {
    * The particle pipeline - wave drive, neighbour build, every substep, XSPH
    * - behind the backend seam (docs/GPU_PLAN.md). CpuSolver is the reference
    * implementation; the WebGPU backend implements the same lifecycle.
+   * Swappable at any frame boundary: both backends treat the SoA arrays as
+   * canonical, so there is no state to migrate.
    */
-  readonly solver: SolverBackend = new CpuSolver(this)
+  solver: SolverBackend = new CpuSolver(this)
   /** Frame-level wave forcing, set by Conditions, applied by the solver. */
   waveDrive: WaveDrive | null = null
 
@@ -208,7 +210,8 @@ export class SimWorld {
   readonly profile: Record<string, number> = {}
   profileEnabled = false
 
-  step(dt: number): void {
+  /** Profile lap helpers, shared by the sync and async step paths. */
+  private profLaps(): { mark: () => void; lap: (key: string) => void } {
     const prof = this.profileEnabled ? this.profile : null
     if (prof) for (const k of Object.keys(prof)) prof[k] = 0
     let t0 = 0
@@ -220,7 +223,11 @@ export class SimWorld {
           t0 = t1
         }
       : () => {}
+    return { mark, lap }
+  }
 
+  /** Everything before the solver: terrain boundary, water field, forces. */
+  private frameHead(dt: number, mark: () => void, lap: (key: string) => void): void {
     this.ensureTerrainBoundary()
     // The hash built this step sees every live particle, so the recent-spawn
     // list has done its job and hands occupancy checks back to hasFluidNear.
@@ -240,15 +247,44 @@ export class SimWorld {
     this.wind.advance(dt)
     this.applyWind()
     lap('forces')
-    // The whole particle pipeline - wave drive, neighbours, all substeps,
-    // XSPH - runs behind the backend seam; per-pass profile laps continue
-    // inside it. See solver.ts.
-    this.solver.sync()
-    this.solver.step(dt)
+  }
+
+  /** Everything after the solver: acceleration reset, damage, breakage. */
+  private frameTail(dt: number, mark: () => void, lap: (key: string) => void): void {
     mark()
     this.clearAccelerations()
     this.updateDamage(dt)
     lap('frameTail')
+  }
+
+  /**
+   * One frame, synchronous - the CPU-backend contract every test and the CPU
+   * host path use. The whole particle pipeline (wave drive, neighbours, all
+   * substeps, XSPH) runs behind the backend seam; per-pass profile laps
+   * continue inside it. See solver.ts.
+   */
+  step(dt: number): void {
+    const { mark, lap } = this.profLaps()
+    this.frameHead(dt, mark, lap)
+    this.solver.sync()
+    this.solver.step(dt)
+    this.frameTail(dt, mark, lap)
+  }
+
+  /**
+   * One frame, awaiting the backend's readback before the host consumes the
+   * results - the GPU-backend path (the CPU backend's readback resolves
+   * immediately, so this is also correct, just needlessly async, on CPU).
+   * Damage/breakage and everything downstream (snapshots, spawn admission)
+   * see this frame's true state on both backends.
+   */
+  async stepAsync(dt: number): Promise<void> {
+    const { mark, lap } = this.profLaps()
+    this.frameHead(dt, mark, lap)
+    this.solver.sync()
+    this.solver.step(dt)
+    await this.solver.readback()
+    this.frameTail(dt, mark, lap)
   }
 
   /**

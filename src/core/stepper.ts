@@ -33,7 +33,9 @@ export interface StepperOptions {
    * or two) still catch up fully.
    */
   maxCatchUpSteps?: number
-  fixedUpdate(dt: number): void
+  /** May be async (the GPU backend awaits its readback); the async advance
+   *  path awaits each step, the sync path requires a sync fixedUpdate. */
+  fixedUpdate(dt: number): void | Promise<void>
   /**
    * Called once per advance(), after the frame's steps. `alpha` is the 0..1
    * interpolation factor between the last two fixed states. In the worker this
@@ -85,7 +87,14 @@ export class FixedStepper {
    * verification (the pump command), where no wall clock is involved.
    */
   step(): void {
-    this.fixedUpdate(this.fixedDt)
+    void this.fixedUpdate(this.fixedDt)
+    this.stats.simTime += this.fixedDt
+    this.stats.totalSteps++
+  }
+
+  /** step(), awaiting an async fixedUpdate (the GPU backend's readback). */
+  async stepAsync(): Promise<void> {
+    await this.fixedUpdate(this.fixedDt)
     this.stats.simTime += this.fixedDt
     this.stats.totalSteps++
   }
@@ -124,6 +133,41 @@ export class FixedStepper {
     // Debt we chose not to run is dropped, not carried: carrying it means the
     // next frame starts behind too, and an over-budget sim never sees a
     // healthy frame again. Dropping it is the slow-motion contract.
+    if (this.accumulator >= this.fixedDt) {
+      this.accumulator = this.accumulator % this.fixedDt
+      starved = true
+    }
+    this.stats.stepsLastFrame = steps
+    this.stats.starved = starved
+
+    this.frameEnd(this.accumulator / this.fixedDt, this.stats)
+  }
+
+  /**
+   * advance(), awaiting each step - the path the sim worker drives, since the
+   * GPU backend's step completes at its readback. MUST mirror advance()'s
+   * accounting exactly; the overload tests pin the sync twin.
+   */
+  async advanceAsync(now: number): Promise<void> {
+    let frameMs = now - this.lastTime
+    this.lastTime = now
+
+    let starved = frameMs > this.maxFrameMs
+    if (starved) frameMs = this.maxFrameMs
+
+    this.stats.frameMs = frameMs
+    this.stats.smoothedFrameMs = this.stats.smoothedFrameMs === 0
+      ? frameMs
+      : this.stats.smoothedFrameMs * 0.9 + frameMs * 0.1
+
+    this.accumulator += frameMs / 1000
+
+    let steps = 0
+    while (this.accumulator >= this.fixedDt && steps < this.maxCatchUpSteps) {
+      await this.stepAsync()
+      this.accumulator -= this.fixedDt
+      steps++
+    }
     if (this.accumulator >= this.fixedDt) {
       this.accumulator = this.accumulator % this.fixedDt
       starved = true

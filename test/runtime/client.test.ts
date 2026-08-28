@@ -17,7 +17,7 @@ function loopback() {
 
   const client = new SimClient(
     {
-      postMessage: (cmd: Command) => host!.handleCommand(cmd),
+      postMessage: (cmd: Command) => host!.enqueue(cmd),
       onMessage: (cb) => {
         toClient = cb
       },
@@ -28,10 +28,10 @@ function loopback() {
   host.start(0)
 
   let t = 0
-  const frame = () => {
+  const frame = async () => {
     t += 1000 / 60
     clock = t
-    host!.tick(t)
+    await host!.tick(t)
   }
   return { client, host, frame, setClock: (ms: number) => (clock = ms) }
 }
@@ -39,16 +39,16 @@ function loopback() {
 describe('SimClient over loopback', () => {
   it('resolves pump() and reflects the advance in the next snapshot', async () => {
     const { client, frame } = loopback()
-    frame()
+    await frame()
     const before = client.latest!.scalars.frame
     const done = client.pump(5)
+    await frame() // the queued pump drains at the frame boundary
     await expect(done).resolves.toBeUndefined()
-    frame()
     expect(client.latest!.scalars.frame).toBe(before + 5 + 1)
   })
 
   it('save() returns the live document', async () => {
-    const { client } = loopback()
+    const { client, frame } = loopback()
     client.send({
       type: 'buildMember',
       fromNode: null,
@@ -59,16 +59,18 @@ describe('SimClient over loopback', () => {
       toY: 6,
       material: 'wood',
     })
-    const saved = await client.save()
+    const savedP = client.save()
+    await frame()
+    const saved = await savedP
     expect(saved.level.widthM).toBe(120)
     expect(saved.solution.members.length).toBe(1)
   })
 
-  it('keeps two snapshots and computes a clamped renderAlpha between them', () => {
+  it('keeps two snapshots and computes a clamped renderAlpha between them', async () => {
     const { client, frame, setClock } = loopback()
-    frame()
+    await frame()
     client.send({ type: 'setWind', kph: 10 }) // dirty -> next tick emits
-    frame()
+    await frame()
     expect(client.previous).not.toBeNull()
     expect(client.latest).not.toBeNull()
     expect(client.latest).not.toBe(client.previous)
@@ -83,13 +85,13 @@ describe('SimClient over loopback', () => {
     expect(client.renderAlpha()).toBe(1)
   })
 
-  it('recycles retired snapshot buffers back into the host pool', () => {
+  it('recycles retired snapshot buffers back into the host pool', async () => {
     const { client, frame } = loopback()
     const buffers: ArrayBuffer[] = []
     client.onSnapshot((snap) => buffers.push(snap.body.posX.buffer as ArrayBuffer))
     for (let i = 0; i < 4; i++) {
       client.send({ type: 'setWind', kph: i + 1 })
-      frame()
+      await frame()
     }
     expect(buffers.length).toBe(4)
     // Snapshot 1's buffer retires when snapshot 3 arrives, goes home, and the

@@ -119,6 +119,7 @@ export class Game {
       .add('frame', () => `${this.smoothedFrameMs.toFixed(1)} ms`)
       .add('fps', () => `${(1000 / Math.max(this.smoothedFrameMs, 0.001)).toFixed(0)}`)
       .add('sim step', () => `${(s()?.stepMs ?? 0).toFixed(1)} ms`)
+      .add('backend', () => s()?.backend ?? 'starting')
       .add('state', () => {
         const sc = s()
         if (!sc || sc.paused) return 'PAUSED'
@@ -347,6 +348,16 @@ export class Game {
 
   private buildSolverPanel(): Panel {
     const panel = new Panel({ title: 'solver', side: 'right', width: 205, collapsed: true })
+
+    new Choice<'webgpu' | 'cpu'>(panel.body, {
+      label: 'backend',
+      value: 'webgpu',
+      options: [
+        { value: 'webgpu', label: 'webgpu' },
+        { value: 'cpu', label: 'cpu (reference)' },
+      ],
+      onChange: (v) => this.client.send({ type: 'setBackend', backend: v }),
+    })
 
     new Slider(panel.body, {
       label: 'substeps',

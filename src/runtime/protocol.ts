@@ -65,6 +65,7 @@ export type Command =
   | { type: 'setLinearDamping'; value: number }
   | { type: 'setFluidIterations'; iterations: number }
   | { type: 'setFluidSpacing'; spacing: number }
+  | { type: 'setBackend'; backend: 'cpu' | 'webgpu' }
   // -- level
   | { type: 'setFieldWidth'; widthM: number }
   | { type: 'loadProbe'; probe: ProbeName }
@@ -102,6 +103,8 @@ export interface SnapshotScalars {
   widthM: number
   /** Smoothed wall-clock cost of one sim step, ms. */
   stepMs: number
+  /** Active solver backend: 'webgpu', 'cpu', or 'cpu (no webgpu)'. */
+  backend: string
 }
 
 /**

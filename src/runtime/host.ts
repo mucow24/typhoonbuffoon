@@ -4,7 +4,9 @@ import { Session } from '../game/session'
 import { WaterEmitter } from '../game/waterEmitter'
 import { allIds, claimIds, defaultLevel, migrateLevel, migrateSolution } from '../model/level'
 import { buildBeam, buildLoadTest } from '../scenes/demos'
+import { GpuSolver } from '../sim/gpu/gpuSolver'
 import { materialAt } from '../sim/materials'
+import { CpuSolver } from '../sim/solver'
 import { SimWorld } from '../sim/world'
 import { Field } from '../world/field'
 import { encodeSnapshot } from './snapshot'
@@ -42,6 +44,14 @@ export class SimHost {
   private paused = true
   private breakCount = 0
   private stepMs = 0
+  private backendName = 'cpu'
+  /**
+   * Commands queue and drain only at frame boundaries: the GPU backend's
+   * step is async, so worker messages can arrive MID-STEP - and a topology
+   * edit landing between substeps would corrupt the frame.
+   */
+  private readonly commandQueue: Command[] = []
+  private ticking = false
   /** Held-cursor position while the water tool streams, or null. */
   private stream: { x: number; y: number } | null = null
   private pendingEvents: BreakEventVM[] = []
@@ -77,24 +87,64 @@ export class SimHost {
     })
   }
 
+  /**
+   * Construct a host and pick the solver backend: WebGPU when a device
+   * exists (the 10x path - docs/GPU_PLAN.md), the CPU reference otherwise.
+   */
+  static async create(
+    post: (msg: HostMessage, transfer?: Transferable[]) => void,
+    opts: { widthM?: number; seedStarter?: boolean; backend?: 'auto' | 'cpu' } = {},
+  ): Promise<SimHost> {
+    const host = new SimHost(post, opts)
+    if (opts.backend !== 'cpu') {
+      const gpu = await GpuSolver.create(host.sim)
+      if (gpu) {
+        host.sim.solver = gpu
+        host.backendName = 'webgpu'
+      } else {
+        host.backendName = 'cpu (no webgpu)'
+      }
+    }
+    return host
+  }
+
   /** Reset frame timing; call once before the first tick, with the same clock. */
   start(now: number): void {
     this.stepper.beginFrames(now)
   }
 
+  /** Queue a command for the next frame boundary (the worker's entry point). */
+  enqueue(cmd: Command): void {
+    this.commandQueue.push(cmd)
+  }
+
   /** Advance the fixed-step clock to wall time `now` (ms). */
-  tick(now: number): void {
-    this.stepper.advance(now)
+  async tick(now: number): Promise<void> {
+    if (this.ticking) return
+    this.ticking = true
+    try {
+      await this.drainCommands()
+      await this.stepper.advanceAsync(now)
+    } finally {
+      this.ticking = false
+    }
+  }
+
+  private async drainCommands(): Promise<void> {
+    while (this.commandQueue.length > 0) {
+      const cmd = this.commandQueue.shift()!
+      await this.applyCommand(cmd)
+    }
   }
 
   // ---------------------------------------------------------------- stepping
 
-  private fixedUpdate(dt: number): void {
+  private async fixedUpdate(dt: number): Promise<void> {
     if (this.paused) return
     const t0 = performance.now()
     this.conditions.update(dt)
     if (this.stream) this.emitter.update(this.sim, dt, this.stream.x, this.stream.y)
-    this.sim.step(dt)
+    await this.sim.stepAsync(dt)
     // Every frame, before any command can act on member records: breakage
     // frees constraint slots, and the session must forget those indices
     // before the free list recycles them into someone else's constraints.
@@ -119,7 +169,7 @@ export class SimHost {
 
   // ---------------------------------------------------------------- commands
 
-  handleCommand(cmd: Command): void {
+  private async applyCommand(cmd: Command): Promise<void> {
     switch (cmd.type) {
       // -- session flow
       case 'togglePause':
@@ -142,7 +192,7 @@ export class SimHost {
         this.paused = true
         break
       case 'pump': {
-        for (let i = 0; i < cmd.steps; i++) this.stepper.step()
+        for (let i = 0; i < cmd.steps; i++) await this.stepper.stepAsync()
         this.post({ type: 'ack', requestId: cmd.requestId })
         break
       }
@@ -233,6 +283,23 @@ export class SimHost {
       case 'setFluidSpacing':
         this.sim.setFluidSpacing(cmd.spacing)
         break
+      case 'setBackend': {
+        // Both backends treat the SoA arrays as canonical, so a swap at a
+        // frame boundary migrates nothing.
+        if (cmd.backend === 'cpu') {
+          this.sim.solver = new CpuSolver(this.sim)
+          this.backendName = 'cpu'
+        } else {
+          const gpu = await GpuSolver.create(this.sim)
+          if (gpu) {
+            this.sim.solver = gpu
+            this.backendName = 'webgpu'
+          } else {
+            this.backendName = 'cpu (no webgpu)'
+          }
+        }
+        break
+      }
 
       // -- level
       case 'setFieldWidth':
@@ -362,6 +429,7 @@ export class SimHost {
       budget: this.session.doc.budget,
       widthM: this.field.widthM,
       stepMs: this.stepMs,
+      backend: this.backendName,
     }
   }
 
