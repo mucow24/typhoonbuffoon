@@ -23,11 +23,22 @@ export interface SolverBackend {
   /** Run one full frame: wave drive, neighbour build, all substeps, XSPH. */
   step(dt: number): void
   /**
-   * Make the frame's outputs (positions, velocities, strain, density...)
-   * visible to host logic. CPU: already visible. GPU: awaits the staging
-   * copy - one frame lagged on the pipelined path.
+   * FLUSH: make every submitted frame's outputs (positions, velocities,
+   * strain, density...) visible to host logic, waiting as long as that
+   * takes. CPU: already visible. This is the synchronous contract the
+   * parity tests and SimWorld.stepAsync rely on.
    */
   readback(): Promise<void>
+  /**
+   * PIPELINED consume: apply whichever submitted frames are ALREADY
+   * complete, without waiting - blocking only for backpressure when the
+   * in-flight queue is full. The host loop calls this instead of
+   * readback(), because a GPU fence takes ~17-21 ms to observe in real
+   * browsers regardless of workload: any loop that waits for the CURRENT
+   * frame's fence caps below 60 Hz with an empty scene. Absent on backends
+   * with nothing in flight (CPU).
+   */
+  reap?(): Promise<void>
   /** Release device resources on backend swap. CPU backends have none. */
   dispose?(): void
 }

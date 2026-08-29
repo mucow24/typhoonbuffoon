@@ -348,18 +348,65 @@ describe('SimHost', () => {
     expect(last().scalars.simFps).toBe(0) // paused
 
     host.enqueue({ type: 'togglePause' })
-    // Enough frames for the smoothing to converge: per-tick step counts
-    // oscillate 0/1/2 at float boundaries of the accumulator, so instant
-    // samples swing while the mean is 60.
-    for (let i = 0; i < 30; i++) await frame()
+    // Windowed measurement (~250 ms windows): a healthy fake 60 Hz clock
+    // must READ as ~60 - the per-tick-average estimator this replaced
+    // showed 46 on a genuinely 60 Hz sim.
+    for (let i = 0; i < 40; i++) await frame()
     const running = last().scalars.simFps
-    expect(running).toBeGreaterThan(35)
-    expect(running).toBeLessThan(85)
+    expect(running).toBeGreaterThan(52)
+    expect(running).toBeLessThan(68)
 
     host.enqueue({ type: 'togglePause' })
     await frame()
     await frame()
     expect(last().scalars.simFps).toBe(0)
+  })
+
+  it('sustains ~60 Hz against a GPU fence that lags a full frame', async () => {
+    // THE field bug, encoded: real browsers resolve mapAsync ~17-21 ms after
+    // submit even for a 256-byte copy (measured live). A host loop that ever
+    // waits for the CURRENT frame's fence caps at ~45 Hz with an EMPTY scene
+    // - which is exactly how it shipped, twice. This test drives the real
+    // host loop on a real wall clock against a backend with that latency,
+    // and fails unless the loop keeps stepping while fences are in flight.
+    const { host } = makeHost()
+    const FENCE_MS = 20
+    const inFlight: number[] = [] // readyAt timestamps, oldest first
+    let steps = 0
+    const consumeReady = () => {
+      while (inFlight.length > 0 && performance.now() >= inFlight[0]!) inFlight.shift()
+    }
+    const awaitFront = async () => {
+      const readyAt = inFlight.shift()!
+      const wait = readyAt - performance.now()
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+    }
+    host.sim.solver = {
+      sync: () => {},
+      step: () => {
+        steps++
+        inFlight.push(performance.now() + FENCE_MS)
+      },
+      // Flush-all: the synchronous/parity contract.
+      readback: async () => {
+        while (inFlight.length > 0) await awaitFront()
+      },
+      // Consume what is ready; block only for backpressure at depth 2.
+      reap: async () => {
+        consumeReady()
+        if (inFlight.length >= 2) await awaitFront()
+      },
+    }
+    host.enqueue({ type: 'togglePause' })
+    const t0 = performance.now()
+    host.start(t0)
+    // Drive ticks the way the worker shell does, for 1.2 s of real time.
+    while (performance.now() < t0 + 1200) {
+      await host.tick(performance.now())
+      await new Promise((r) => setTimeout(r, 4))
+    }
+    const hz = (steps * 1000) / (performance.now() - t0)
+    expect(hz).toBeGreaterThan(55)
   })
 
   it('reset restores the play snapshot and pauses', async () => {

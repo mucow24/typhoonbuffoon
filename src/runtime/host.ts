@@ -130,11 +130,12 @@ export class SimHost {
     this.ticking = true
     this.tickNow = now
     try {
-      // Consume any in-flight GPU frame BEFORE commands touch the particle
-      // store: a mutation applied under a pending frame would be clobbered
-      // when that frame's results land. (No-op on CPU, and when nothing is
-      // pending.)
-      await this.sim.solver.readback()
+      // Land whatever GPU frames have COMPLETED - never waiting on one that
+      // hasn't (reap): real-browser fences take ~17-21 ms to observe, so a
+      // loop that waits for the current frame caps below 60 Hz at idle.
+      // Host-created particles are write-stamped, so frames still in flight
+      // cannot clobber anything commands create next.
+      await this.reapSolver()
       await this.drainCommands()
       await this.stepper.advanceAsync(now)
     } finally {
@@ -142,9 +143,21 @@ export class SimHost {
     }
   }
 
+  private reapSolver(): Promise<void> {
+    const solver = this.sim.solver
+    return solver.reap ? solver.reap() : solver.readback()
+  }
+
   private tickNow = 0
 
-  /** Achieved sim steps per wall second, smoothed - the slow-mo readout. */
+  /**
+   * Achieved sim steps per wall second - the slow-mo readout. Measured over
+   * fixed ~250 ms windows of wall time, NOT as an average of per-tick
+   * instantaneous rates: ticks that run steps systematically follow longer
+   * gaps, so the per-tick average under-reads (a healthy 60 Hz sim showed
+   * 46 on the HUD - a lying gauge on exactly the number this row exists to
+   * make trustworthy).
+   */
   private trackSimRate(now: number): void {
     if (this.paused) {
       this.simFps = 0
@@ -152,10 +165,15 @@ export class SimHost {
       return
     }
     const steps = this.stepper.stats.totalSteps
-    if (this.rateLastNow > 0 && now > this.rateLastNow) {
-      const inst = ((steps - this.rateLastSteps) * 1000) / (now - this.rateLastNow)
-      this.simFps = this.simFps === 0 ? inst : this.simFps * 0.9 + inst * 0.1
+    if (this.rateLastNow === 0) {
+      this.rateLastNow = now
+      this.rateLastSteps = steps
+      return
     }
+    const elapsed = now - this.rateLastNow
+    if (elapsed < 250) return
+    const windowed = ((steps - this.rateLastSteps) * 1000) / elapsed
+    this.simFps = this.simFps === 0 ? windowed : this.simFps * 0.7 + windowed * 0.3
     this.rateLastNow = now
     this.rateLastSteps = steps
   }
@@ -192,7 +210,7 @@ export class SimHost {
   private async fixedUpdate(dt: number): Promise<void> {
     if (this.paused) return
     const t0 = performance.now()
-    await this.sim.solver.readback()
+    await this.reapSolver()
     this.conditions.update(dt)
     if (this.stream) this.emitter.update(this.sim, dt, this.stream.x, this.stream.y)
     this.sim.step(dt)

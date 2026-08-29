@@ -48,6 +48,16 @@ export class ParticleStore {
    * conserved anyway - a stretched beam did not gain material.
    */
   volume: Float32Array
+  /**
+   * Host-write epoch per slot, stamped by create(). The pipelined GPU
+   * backend keeps frames in flight; when their results land they must not
+   * overwrite a slot the host RE-CREATED after the frame was captured (a
+   * recycled slot would teleport to the dead particle's old position).
+   * The backend snapshots `stampValue` at capture and skips newer slots.
+   */
+  writeStamp: Uint32Array
+  /** Monotonic epoch; the GPU backend advances it at each capture. */
+  stampValue = 1
 
   constructor(capacity = 4096) {
     this.slots = new SlotAllocator(capacity)
@@ -64,6 +74,7 @@ export class ParticleStore {
     this.kind = new Uint8Array(capacity)
     this.cluster = new Int32Array(capacity)
     this.volume = new Float32Array(capacity)
+    this.writeStamp = new Uint32Array(capacity)
 
     this.slots.onGrow = (cap) => this.grow(cap)
   }
@@ -82,6 +93,9 @@ export class ParticleStore {
     this.kind = SlotAllocator.growU8(this.kind, cap)
     this.cluster = SlotAllocator.growI32(this.cluster, cap)
     this.volume = SlotAllocator.growF32(this.volume, cap)
+    const ws = new Uint32Array(cap)
+    ws.set(this.writeStamp)
+    this.writeStamp = ws
   }
 
   get count(): number {
@@ -111,6 +125,7 @@ export class ParticleStore {
     this.kind[i] = spec.kind ?? KIND_NODE
     this.cluster[i] = spec.cluster ?? -1
     this.volume[i] = spec.volume ?? 0
+    this.writeStamp[i] = this.stampValue
     return i
   }
 

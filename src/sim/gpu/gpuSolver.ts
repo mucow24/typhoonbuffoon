@@ -23,6 +23,20 @@ import { KERNELS, type KernelName } from './shaders'
 
 const HASH_MASK = (1 << KIND_FLUID) | (1 << KIND_OBJECT) | (1 << KIND_BOUNDARY)
 
+/** One submitted GPU frame whose results have not been consumed yet. */
+interface PendingFrame {
+  staging: GPUBuffer
+  stag: StagingLayout
+  n: number
+  distHW: number
+  bendHW: number
+  clusters: { cx: number; cy: number; angle: number }[]
+  /** ParticleStore.stampValue at capture: newer host writes win on apply. */
+  capturedStamp: number
+  state: 'pending' | 'ok' | 'err'
+  map: Promise<boolean>
+}
+
 /** Workgroup width per kernel; gather-heavy kernels run wide for latency
  *  hiding on iGPUs. MUST match the @workgroup_size in shaders.ts. */
 const WG: Partial<Record<KernelName, number>> = {
@@ -109,7 +123,8 @@ export class GpuSolver implements SolverBackend {
   private terr!: GPUBuffer
   private matSec!: GPUBuffer
   private gath!: GPUBuffer
-  /** Ping-pong readback stagings: one in flight (mapped), one to write. */
+  /** Readback staging ring: up to two frames in flight (mapped) + one
+   *  being written this frame. */
   private stagingPair: GPUBuffer[] = []
   private stagingFlip = 0
 
@@ -141,9 +156,9 @@ export class GpuSolver implements SolverBackend {
   /** SolverBackend.dispose: release the device promptly on backend swap -
    *  the JS wrapper is tiny, the GPU allocations behind it are not. */
   dispose(): void {
-    // A pending map rejects on destroy; its .then handler turns that into a
-    // skipped apply rather than an unhandled rejection.
-    this.pending = null
+    // Pending maps reject on destroy; their .then handlers turn that into
+    // skipped applies rather than unhandled rejections.
+    this.pendingQ.length = 0
     this.device.destroy()
   }
 
@@ -195,6 +210,10 @@ export class GpuSolver implements SolverBackend {
     this.frameN = n
     this.frameDistHW = w.distance.highWater
     this.frameBendHW = w.bend.highWater
+    // Capture the host-write epoch: particles created after this point must
+    // not be overwritten when this frame's results land (see applyPending).
+    this.capturedStamp = p.stampValue
+    p.stampValue++
 
     // Particle f32 sections straight from the SoA arrays.
     const wf = (sec: number, arr: Float32Array) => {
@@ -545,7 +564,7 @@ export class GpuSolver implements SolverBackend {
     // ping-pong pair that is not still mapped by the pending frame.
     const st = this.stag!
     const staging = this.stagingPair[this.stagingFlip]!
-    this.stagingFlip ^= 1
+    this.stagingFlip = (this.stagingFlip + 1) % 3
     const cp = (src: GPUBuffer, srcOff: number, dstOff: number, words: number) => {
       if (words > 0) enc.copyBufferToBuffer(src, srcOff, staging, dstOff, words * 4)
     }
@@ -563,53 +582,93 @@ export class GpuSolver implements SolverBackend {
 
     this.device.queue.submit([enc.finish()])
 
-    // Map starts NOW; it resolves whenever the GPU finishes the frame. The
-    // caller decides when to await it - the pipelined host consumes it at
-    // the TOP of the NEXT step, by which point it has had a whole frame to
-    // complete, so the mapAsync round-trip latency (1-25 ms depending on
-    // environment - the thing that capped an IDLE scene at 45 Hz when
-    // awaited in line) leaves the critical path entirely.
-    this.pending = {
+    // Map starts NOW; it resolves whenever the GPU finishes AND the fence
+    // is observed - which real browsers take ~17-21 ms to do even for a
+    // 256-byte copy (measured). The record joins the in-flight queue; the
+    // host reaps completed frames without ever waiting for the current one.
+    const rec: PendingFrame = {
       staging,
       stag: st,
       n,
       distHW: this.frameDistHW,
       bendHW: this.frameBendHW,
       clusters: this.liveClusters,
-      map: staging.mapAsync(GPUMapMode.READ).then(
-        () => true,
-        () => false, // device lost / disposed mid-flight: skip the apply
-      ),
+      capturedStamp: this.capturedStamp,
+      state: 'pending',
+      map: undefined as unknown as Promise<boolean>,
     }
+    rec.map = staging.mapAsync(GPUMapMode.READ).then(
+      () => {
+        rec.state = 'ok'
+        return true
+      },
+      () => {
+        rec.state = 'err' // device lost / disposed mid-flight: skip the apply
+        return false
+      },
+    )
+    this.pendingQ.push(rec)
   }
 
   // --------------------------------------------------------------- readback
 
-  /** One submitted frame whose results have not been consumed yet. */
-  private pending: {
-    staging: GPUBuffer
-    stag: StagingLayout
-    n: number
-    distHW: number
-    bendHW: number
-    clusters: { cx: number; cy: number; angle: number }[]
-    map: Promise<boolean>
-  } | null = null
+  /** Frames submitted but not yet consumed, oldest first. Depth 2: enough to
+   *  hide a fence latency of up to two full frames (~33 ms). */
+  private pendingQ: PendingFrame[] = []
+  private capturedStamp = 0
 
   /**
-   * Consume the oldest submitted frame into the SoA arrays, if any. The
-   * synchronous path (tests, parity) calls this right after step() for
-   * exact depth-0 semantics; the host calls it at the START of each step,
-   * making the pipeline depth 1 and the stall ~zero. All sizes and targets
-   * come from the pending record - the world may have changed since.
+   * FLUSH: consume every in-flight frame, waiting as long as that takes.
+   * The synchronous path (tests, parity, SimWorld.stepAsync) uses this for
+   * exact depth-0 semantics.
    */
   async readback(): Promise<void> {
-    const pend = this.pending
-    if (!pend) return
-    this.pending = null
-    const ok = await pend.map
-    if (!ok) return
+    let applied = false
+    while (this.pendingQ.length > 0) {
+      const pend = this.pendingQ.shift()!
+      const ok = await pend.map
+      if (ok) {
+        this.applyPending(pend)
+        applied = true
+      }
+    }
+    if (applied) this.rebuildHash()
+  }
 
+  /**
+   * PIPELINED consume: apply frames whose fences have already been observed
+   * - no waiting - and block only for backpressure when the queue is full.
+   * At steady state the queue sits at depth 2 and the frame being consumed
+   * was submitted two frames ago, so its ~17-21 ms fence has long resolved
+   * and this costs ~nothing. Host state lags the GPU by two frames (~33 ms)
+   * - forces, damage, spawn guards and snapshots all tolerate that by
+   * design, and write-stamps keep host-created particles from being
+   * clobbered by frames captured before they existed.
+   */
+  async reap(): Promise<void> {
+    let applied = false
+    while (this.pendingQ.length > 0 && this.pendingQ[0]!.state !== 'pending') {
+      const pend = this.pendingQ.shift()!
+      if (pend.state === 'ok') {
+        this.applyPending(pend)
+        applied = true
+      }
+    }
+    if (this.pendingQ.length >= 2) {
+      const pend = this.pendingQ.shift()!
+      const ok = await pend.map
+      if (ok) {
+        this.applyPending(pend)
+        applied = true
+      }
+    }
+    if (applied) this.rebuildHash()
+  }
+
+  /** Copy one completed frame's results into the SoA arrays and unmap. All
+   *  sizes and targets come from the record - the world may have changed
+   *  since it was captured. */
+  private applyPending(pend: PendingFrame): void {
     const w = this.w
     const p = w.particles
     const { n, stag: st, staging } = pend
@@ -618,10 +677,23 @@ export class GpuSolver implements SolverBackend {
     const u32 = (off: number, len: number) => new Uint32Array(buf, off, len)
 
     if (n > 0) {
-      p.posX.set(f32(st.posX, n))
-      p.posY.set(f32(st.posY, n))
-      p.velX.set(f32(st.velX, n))
-      p.velY.set(f32(st.velY, n))
+      // Per-slot, stamp-guarded: a slot the host re-created AFTER this frame
+      // was captured (a recycled index - new splash particle, new beam node)
+      // must keep its host-written state, or it teleports to the dead
+      // particle's old position when this frame lands.
+      const sPosX = f32(st.posX, n)
+      const sPosY = f32(st.posY, n)
+      const sVelX = f32(st.velX, n)
+      const sVelY = f32(st.velY, n)
+      const ws = p.writeStamp
+      const captured = pend.capturedStamp
+      for (let i = 0; i < n; i++) {
+        if (ws[i]! > captured) continue
+        p.posX[i] = sPosX[i]!
+        p.posY[i] = sPosY[i]!
+        p.velX[i] = sVelX[i]!
+        p.velY[i] = sVelY[i]!
+      }
 
       // Wetness census into the fluid solver's public arrays (host buoyancy
       // gating reads them); replace wholesale so sizes always fit.
@@ -659,15 +731,19 @@ export class GpuSolver implements SolverBackend {
     })
 
     staging.unmap()
+  }
 
-    // Spawn-admission occupancy (hasFluidNear) reads the CPU hash, which the
-    // CPU solver builds in beginFrame. Rebuild it here from the read-back
-    // positions - same cell size, same kinds, same "last frame's hash"
-    // semantics the admission guards were designed around.
-    const f = w.fluid
+  /**
+   * Spawn-admission occupancy (hasFluidNear) reads the CPU hash, which the
+   * CPU solver builds in beginFrame. Rebuild it from the freshest read-back
+   * positions - same cell size, same kinds, same "last frame's hash"
+   * semantics the admission guards were designed around.
+   */
+  private rebuildHash(): void {
+    const f = this.w.fluid
     const rq = f.spacing * 2 + f.spacing * f.supportMargin
     f.hash.setCellSize(rq)
-    f.hash.build(p, HASH_MASK)
+    f.hash.build(this.w.particles, HASH_MASK)
   }
 
   // ------------------------------------------------------------- allocation
@@ -750,7 +826,7 @@ export class GpuSolver implements SolverBackend {
     // Capacity changes only happen after the pending frame was consumed
     // (sync runs after readback in every step), so the pair is free here.
     for (const s of this.stagingPair) s.destroy()
-    this.stagingPair = [0, 1].map(() =>
+    this.stagingPair = [0, 1, 2].map(() =>
       dev.createBuffer({
         size: this.stag!.totalBytes,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
