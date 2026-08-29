@@ -217,15 +217,17 @@ export class SimHost {
     if (this.paused) return
     const t0 = performance.now()
     // First step of the tick pipelines (reap). Every FURTHER step in the
-    // same tick FLUSHES: fences cannot resolve inside a burst, so without
-    // this every catch-up step computes buoyancy/drag from the same stale
-    // state - force lag doubles exactly when the sim is struggling, and the
-    // phase error pumps floating objects (measured: bob amplitude 0.27 m ->
-    // 2.57 m in 12 s at 52 Hz, crate airborne). Deeper slow-mo under load
-    // is honest; resonance is not. Pump steps flush too, which also makes
-    // manual stepping deterministic.
+    // same tick FLUSHES - but only for backends whose coupling forces are
+    // computed host-side from read-back state: fences cannot resolve inside
+    // a burst, so without the flush every catch-up step computed buoyancy
+    // from the same stale state - force lag doubled exactly when the sim
+    // was struggling, and the phase error pumped floating objects
+    // (measured: bob amplitude 0.27 m -> 2.57 m in 12 s at 52 Hz, crate
+    // airborne). A backend that owns the coupling forces computes them
+    // in-kernel from device-fresh state, so its bursts pipeline at full
+    // speed - everything else the readback feeds tolerates the lag.
     this.stepsThisTick++
-    if (this.stepsThisTick > 1) {
+    if (this.stepsThisTick > 1 && !this.sim.solver.ownsCouplingForces) {
       await this.sim.solver.readback()
     } else {
       await this.reapSolver()

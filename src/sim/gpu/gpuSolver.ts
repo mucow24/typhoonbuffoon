@@ -5,13 +5,17 @@ import type { SimWorld } from '../world'
 import { colorConstraints } from './coloring'
 import {
   BF,
+  CA,
+  CF,
   CL_HEADER_F,
   DF,
   DU,
   BU,
   FC,
   FP_SCALE,
+  FRC,
   FX,
+  MAT_PROPS_STRIDE,
   PF,
   PU,
   UNIFORM_BYTES,
@@ -28,16 +32,17 @@ const HASH_MASK = (1 << KIND_FLUID) | (1 << KIND_OBJECT) | (1 << KIND_BOUNDARY)
  * not hope: a mapAsync fence takes ~17-21 ms to observe on an IDLE iGPU in
  * real browsers, and ~46 ms median once the same iGPU is simulating and
  * rendering a loaded scene (7.8k particles) - so the pipeline must hide
- * as much of that as PHYSICS allows. The ceiling is not fences - it is
- * FORCE FRESHNESS: buoyancy/hydrostatic/drag are computed host-side from
- * read-back state and applied by the GPU frames later, so pipeline depth is
- * force lag. At depth 2 (33 ms, the band the physics review accepted) a
- * floating crate bobs; at depth 4 (66 ms, tried for fence headroom) the
- * phase error PUMPS the bob and a crate launched into the sky off calm
- * water. Depth stays 2. Fences longer than this budget are paid with
- * slow-mo until forces move device-side (the real headroom fix).
+ * as much of that as the readback's CONSUMERS allow. Depth was once
+ * hard-capped at 2 by force lag: host-computed buoyancy acting frames late
+ * is dynamically unstable, and at depth 4 the phase error pumped a floating
+ * crate into the sky. The coupling forces are IN-KERNEL now
+ * (ownsCouplingForces), computed from device-fresh state every frame, so
+ * the readback feeds only damage, spawn guards, probes and snapshots - all
+ * lag-tolerant - and depth 3 buys the ~35 ms fences a LOADED iGPU shows at
+ * 24k particles (idle fences are 17-21 ms; depth 2 stalled 24k at 37 Hz).
+ * Raising this further trades snapshot/input latency, not physics.
  */
-const PIPELINE_DEPTH = 2
+const PIPELINE_DEPTH = 3
 
 /** One submitted GPU frame whose results have not been consumed yet. */
 interface PendingFrame {
@@ -59,6 +64,7 @@ const WG: Partial<Record<KernelName, number>> = {
   gridClear: 256,
   gridScan1: 256,
   gridScan2: 1,
+  colSmooth: 1,
   gridScan3: 256,
   census: 256,
   fluidDensity: 256,
@@ -146,8 +152,14 @@ export class GpuSolver implements SolverBackend {
   private clF!: GPUBuffer
   private clU!: GPUBuffer
   private terr!: GPUBuffer
-  private matSec!: GPUBuffer
+  private matProps!: GPUBuffer
   private gath!: GPUBuffer
+  /** Column-field buffers (device-side sim/water.ts) + the per-frame
+   *  coupling-force accumulator. Sections stride by the LIVE colN uniform. */
+  private colA!: GPUBuffer
+  private colF!: GPUBuffer
+  private frc!: GPUBuffer
+  private colN = 0
   /** Readback staging ring: up to PIPELINE_DEPTH frames in flight (mapped)
    *  + one being written this frame. */
   private stagingPair: GPUBuffer[] = []
@@ -175,8 +187,17 @@ export class GpuSolver implements SolverBackend {
     private readonly device: GPUDevice,
   ) {
     this.ensureCapacity()
-    this.matSecUpload()
+    this.matPropsUpload()
   }
+
+  /**
+   * This backend computes buoyancy, hydrostatic member load and water drag
+   * IN-KERNEL from device-fresh state (colClear..forcesApply), so the world
+   * skips its host-side passes and the host pipelines catch-up bursts.
+   * Host-computed coupling forces acted on read-back state - frames old
+   * under pipelining - and lagged lift resonance-pumped floating objects.
+   */
+  readonly ownsCouplingForces = true
 
   /** SolverBackend.dispose: release the device promptly on backend swap -
    *  the JS wrapper is tiny, the GPU allocations behind it are not. */
@@ -219,6 +240,11 @@ export class GpuSolver implements SolverBackend {
     this.tableSize = gridW * gridH
     this.ensureGrid(this.tableSize)
     const gridGeom = { gridW, gridH, gridX0: w.boundsX0 - MARGIN * cell, gridY0: yLow - MARGIN * cell, cell }
+
+    // Column-field geometry, exactly as sim/water.ts build computes it.
+    const colRes = w.water.resolution
+    const colN = Math.max(1, Math.ceil((w.boundsX1 - w.boundsX0) / colRes) + 1)
+    this.ensureColumns(colN)
 
     if (tGrid && tGrid.heights.length > this.terrCap) {
       this.terrCap = Math.max(tGrid.heights.length, this.terrCap * 2)
@@ -332,6 +358,9 @@ export class GpuSolver implements SolverBackend {
     })
     wdu(DU.alive, (o) => {
       for (let i = 0; i < dn; i++) o[i] = d.slots.alive[i]!
+    })
+    wdu(DU.unbreakable, (o) => {
+      for (let i = 0; i < dn; i++) o[i] = d.unbreakable[i]!
     })
 
     // Bends.
@@ -510,6 +539,12 @@ export class GpuSolver implements SolverBackend {
       memAabbX1: hasMembers ? ax1 + pad : -1e9,
       memAabbY1: hasMembers ? ay1 + pad : -1e9,
       viscEverySub: f.viscosityEverySubstep ? 1 : 0,
+      colN: this.colN,
+      colX0: w.boundsX0,
+      colInvRes: 1 / colRes,
+      colRes,
+      hydroOff: Math.max(1.5 * colRes, 1.0),
+      maxObjBuoy: w.maxObjectBuoyantAccel,
       // dt/h/substep-dependent values are stamped in step().
       dt: 0,
       h: 0,
@@ -573,6 +608,19 @@ export class GpuSolver implements SolverBackend {
       // world; a pure flood pays nothing for them.
       const hasHulls = this.liveClusters.length > 0
       if (hasHulls) run('census', n)
+
+      // Coupling forces from DEVICE-FRESH state - the fix for the force-lag
+      // resonance. Column field first (mirrors water.ts), then member
+      // hydro/drag scatters, then the per-particle resolve + buoyancy into
+      // accX/accY on top of the host's uploaded wind. Once per frame,
+      // before wave and the substeps consume the accumulators.
+      run('colClear', this.colN)
+      run('colAccum', n)
+      run('colSurface', this.colN)
+      run('colSmooth', 1)
+      if (this.frameDistHW > 0) run('forcesMember', this.frameDistHW)
+      run('forcesApply', n)
+
       if (w.waveDrive) run('wave', n)
 
       const distSlotBase = 0
@@ -893,12 +941,15 @@ export class GpuSolver implements SolverBackend {
     this.clU = make(this.clusterCap)
     this.gath?.destroy()
     this.gath = make(cap * 4) // vec4f per particle
+    this.frc?.destroy()
+    this.frc = make(FRC.COUNT * cap) // i32 coupling-force accumulator, zeroed by forcesApply
     this.terr?.destroy()
     this.terr = make(this.terrCap) // sized in sync's buffer-sizing block
-    if (!this.matSec) {
-      this.matSec = make(MATERIAL_IDS.length)
-      this.matSecUpload()
+    if (!this.matProps) {
+      this.matProps = make(MATERIAL_IDS.length * MAT_PROPS_STRIDE)
+      this.matPropsUpload()
     }
+    if (!this.colA) this.ensureColumns(4) // real size follows in sync()
 
     this.stag = stagingLayout(cap, this.distCap, this.bendCap, this.clusterStagingCap)
     // Frames still in flight reference the old staging buffers; destroying
@@ -937,10 +988,29 @@ export class GpuSolver implements SolverBackend {
     this.buildPipelines()
   }
 
-  private matSecUpload(): void {
-    const sections = new Float32Array(MATERIAL_IDS.length)
-    MATERIAL_IDS.forEach((id, i) => (sections[i] = MATERIALS[id].section))
-    this.device.queue.writeBuffer(this.matSec, 0, sections)
+  private matPropsUpload(): void {
+    const props = new Float32Array(MATERIAL_IDS.length * MAT_PROPS_STRIDE)
+    MATERIAL_IDS.forEach((id, i) => {
+      props[i * MAT_PROPS_STRIDE] = MATERIALS[id].section
+      props[i * MAT_PROPS_STRIDE + 1] = MATERIALS[id].dragCoefficient
+    })
+    this.device.queue.writeBuffer(this.matProps, 0, props)
+  }
+
+  /** Column buffers track the field width (colN columns at the water
+   *  field's resolution); growth rebuilds the bind groups like ensureGrid. */
+  private ensureColumns(n: number): void {
+    if (n <= this.colN) return
+    this.colN = n
+    const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    this.colA?.destroy()
+    this.colA = this.device.createBuffer({ size: CA.COUNT * n * 4, usage: S })
+    this.colF?.destroy()
+    this.colF = this.device.createBuffer({ size: CF.COUNT * n * 4, usage: S })
+    // During initial construction the grid buffers do not exist yet;
+    // ensureGrid builds every bind group at the end of that path. Only a
+    // LATER growth (field resize) has to rebuild here itself.
+    if (this.gridS) this.buildPipelines()
   }
 
   /** Buffers per kernel, in @binding order - must match shaders.ts. */
@@ -961,10 +1031,19 @@ export class GpuSolver implements SolverBackend {
       clF,
       clU,
       terr,
-      matSec,
+      matProps,
       gath,
+      colA,
+      colF,
+      frc,
     } = this
     return {
+      colClear: [uni, colA, colF],
+      colAccum: [uni, pf, pu, colA],
+      colSurface: [uni, colA, colF],
+      colSmooth: [uni, colF],
+      forcesMember: [uni, pf, pu, df, du, frc, matProps, colF],
+      forcesApply: [uni, pf, pu, frc, colF],
       gridClear: [uni, gridA, gridS],
       packGather: [uni, pf, pu, gridS, gath],
       gridCount: [uni, pf, pu, gridA],
@@ -984,7 +1063,7 @@ export class GpuSolver implements SolverBackend {
       fluidCorrect: [uni, pf, pu, gridS, fx, gath],
       fluidApply: [uni, pf, pu, fx],
       contactsSolid: [uni, pf, pu, gridS],
-      contactsMember: [uni, pf, pu, df, du, fx, fc, matSec],
+      contactsMember: [uni, pf, pu, df, du, fx, fc, matProps],
       integrate: [uni, pf, pu, fx, fc, terr],
       snapVel: [uni, pf, pu],
       packXsph: [uni, pf, pu, gridS, gath],

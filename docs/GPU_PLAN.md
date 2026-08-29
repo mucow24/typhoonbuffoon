@@ -39,25 +39,36 @@ test/gpu/pipeline.test.ts pins both the advancement rate and the recycled-
 slot stamp guard, mutation-checked. Host logic sees positions up to two
 frames old, the lag this plan always budgeted for.
 
-**The open ceiling, precisely (2026-08-29): host-side coupling forces.**
-Buoyancy, hydrostatic wall load and water drag are computed on the host
-from read-back state, so pipeline depth IS force lag - and force lag is
+**The force-lag ceiling, found and CLOSED (2026-08-29).** Buoyancy,
+hydrostatic wall load and water drag were computed on the host from
+read-back state, so pipeline depth WAS force lag - and force lag is
 dynamically unstable: at depth 4 (66 ms, tried for fence headroom) the
 phase error resonance-pumped a floating crate out of the water and into
-the sky; even at depth 2, catch-up bursts recompute forces from the same
-un-landed state, so the lag doubles exactly when the sim is struggling
-(measured: bob amplitude 0.27 m -> 2.57 m in 12 s at 52 Hz). Two
-mitigations shipped: rendering is capped at 60 fps (uncapped rAF on
-high-refresh displays burned the same iGPU the solver needs - fences went
-~20 ms -> ~46 ms median under load), and every catch-up step after the
-first in a tick FLUSHES before stepping (test-pinned), which keeps forces
-fresh at the price of honest, deeper slow-mo under load (~44 Hz at 7.8k
-on the floor adapter). The real fix, next: move the water column field
-and the coupling forces INTO kernels (the wetness census already is).
-Fresh forces every frame from device state ends the depth ceiling, the
-burst flushes, and most of the readback entirely - readback then feeds
-only damage, spawn guards, probes and snapshots, all lag-tolerant, and
-the fence stops being on the critical path at any depth.
+the sky; even at depth 2, catch-up bursts recomputed forces from the same
+un-landed state, so the lag doubled exactly when the sim was struggling
+(measured: bob amplitude 0.27 m -> 2.57 m in 12 s at 52 Hz, and 7.8k
+water pinned at 43-50 Hz all morning). The fix: the water column field
+and all three coupling forces now run IN-KERNEL from device-fresh state
+(`ownsCouplingForces`; the wetness census already was), the CPU reference
+keeps its host-side passes as canon, and the world applies host passes
+exactly when the backend does not own them. Fresh forces end the depth
+ceiling and the burst flushes; the readback now feeds only damage, spawn
+guards, probes and snapshots - all lag-tolerant - so PIPELINE_DEPTH is 3
+and fences left the critical path. Rendering is also capped at ~60 fps
+(uncapped rAF on high-refresh displays burned the same iGPU the solver
+needs: fences went ~20 -> ~46 ms median). Measured after, floor adapter,
+visible tab: 7.8k-10k at 60 Hz with 0.0 ms fence wait and ~1 ms steps
+(was 43 Hz / 16 ms); the water-tool stream holds 61 Hz at 8k; 24k runs
+41 Hz honest slow-mo - that rung is the adapter's own execution limit
+(~15 ms/frame interactive), which slow-mo is the designed answer to.
+Coupling parity is pinned by isolating scenes (test/gpu/coupling.test.ts:
+deep-node lift, dry-post hydrostatic push) plus aggregate bands (crate
+draft, wall load, submerged fall) - buoyancy and hydro mutation-verified;
+drag is aggregate-only because it co-fires with displacement contacts by
+construction (a driven current bulldozes a post identically with drag
+disabled - measured), the same combined-sum footing its CPU calibration
+stands on. Two sims sharing one iGPU (two open tabs) halve each other;
+compare tabs one at a time.
 
 What shipped matches this plan with three notable learnings:
 

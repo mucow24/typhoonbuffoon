@@ -41,6 +41,18 @@ export interface SolverBackend {
   reap?(): Promise<void>
   /** Release device resources on backend swap. CPU backends have none. */
   dispose?(): void
+  /**
+   * True when the backend computes the water-coupling forces (buoyancy,
+   * hydrostatic member load, water drag) itself, from state that is fresh
+   * INSIDE the frame. The world then skips its host-side passes for those
+   * forces (wind always stays host-side), and the host may pipeline
+   * catch-up bursts instead of flushing before each one. This flag exists
+   * because host-computed coupling forces act on read-back state - frames
+   * old under pipelining - and lagged lift is dynamically unstable: it
+   * resonance-pumped a floating crate out of the water. Absent/false on
+   * the CPU reference, whose forces are fresh by construction.
+   */
+  readonly ownsCouplingForces?: boolean
 }
 
 /** Frame-level wave forcing, set by Conditions, applied by the backend -

@@ -264,6 +264,48 @@ describe('gpu parity', () => {
     expect(Math.abs(meanGpu - meanCpu)).toBeLessThan(0.3)
   })
 
+  it('a wood wall carries the same hydrostatic load (member coupling forces)', async () => {
+    // The member half of the water coupling: a breakable wood wall holds a
+    // pond. Static column pressure (applyHydrostaticLoad) plus the fill
+    // transient's drag load the wall's constraints; the calibrated combined
+    // load is what the material constants are tuned against, so the two
+    // backends must agree on it - this is the scene that pins the coupling
+    // through the GPU force port.
+    const build = (sim: SimWorld) => {
+      buildWall(sim, { x: 4, yBottom: 0, yTop: 5 })
+      fillWater(sim, { x0: -6, x1: 3.5, yTop: 2.2 })
+    }
+    const { cpu, gpu } = twinWorlds(build)
+    await run(cpu, gpu, 240)
+    // Time-averaged peak strain over a further second: instantaneous strain
+    // rides slosh phase, which is exactly where f32 ordering diverges.
+    const peak = (w: SimWorld) => {
+      const d = w.distance
+      let worst = 0
+      for (let m = 0; m < d.highWater; m++) {
+        if (d.slots.alive[m] !== 1 || d.rest[m]! <= 1e-6) continue
+        worst = Math.max(worst, Math.abs(d.strain[m]!))
+      }
+      return worst
+    }
+    let sumCpu = 0
+    let sumGpu = 0
+    for (let i = 0; i < 60; i++) {
+      cpu.step(1 / 60)
+      await gpu.stepAsync(1 / 60)
+      sumCpu += peak(cpu)
+      sumGpu += peak(gpu)
+    }
+    const loadCpu = sumCpu / 60
+    const loadGpu = sumGpu / 60
+    // The wall is genuinely loaded on both backends, holds the water, and
+    // the loads agree within the band float ordering allows.
+    expect(loadCpu).toBeGreaterThan(1e-4)
+    expect(loadGpu).toBeGreaterThan(1e-4)
+    expect(waterBeyond(gpu, 4.6, 'right')).toBe(0)
+    expect(Math.abs(loadGpu - loadCpu)).toBeLessThan(Math.max(loadCpu * 0.5, 2e-4))
+  })
+
   it('two crates stack instead of passing through (object-object contacts)', async () => {
     const { cpu, gpu } = twinWorlds((sim) => {
       sim.addObject({ cx: 0, cy: 0.8, width: 1.6, height: 1, density: 400 })

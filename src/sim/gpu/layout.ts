@@ -73,7 +73,31 @@ export const FC = {
 /** Distance-constraint f32 sections (buffer `df`). */
 export const DF = { rest: 0, compliance: 1, zeta: 2, lambda: 3, strain: 4, COUNT: 5 } as const
 /** Distance-constraint u32 sections (buffer `du`). */
-export const DU = { a: 0, b: 1, mat: 2, noCol1: 3, alive: 4, COUNT: 5 } as const
+export const DU = { a: 0, b: 1, mat: 2, noCol1: 3, alive: 4, unbreakable: 5, COUNT: 6 } as const
+
+/**
+ * Water-column sections. `colA` (atomic i32): per-column accumulators the
+ * fluid scatters into each frame. `colF` (f32): the finished field the
+ * coupling-force kernels read. Column geometry rides the uniforms (colN,
+ * colX0, colInvRes) and mirrors sim/water.ts exactly - the CPU field stays
+ * host-side for wind exposure, conditions and probes.
+ */
+export const CA = { count: 0, floorFP: 1, velXFP: 2, velYFP: 3, COUNT: 4 } as const
+export const CF = { surface: 0, velX: 1, velY: 2, COUNT: 3 } as const
+
+/** Per-frame coupling-force accumulators (buffer `frc`, atomic i32 fixed
+ *  point at FORCE_FP): member hydro/drag scatter, forcesApply resolves. */
+export const FRC = { accX: 0, accY: 1, COUNT: 2 } as const
+
+/** Fixed point for FORCE/VELOCITY accumulation (2^12): accelerations reach
+ *  ~1e3 m/s^2 summed over several members per endpoint, and column velocity
+ *  sums span hundreds of particles - the position-grade 2^20 scale
+ *  overflows i32 there, and 0.25 mm precision is far under any force that
+ *  matters. */
+export const FORCE_FP = 1 << 12
+
+/** Floats per material in the `matProps` buffer: [section, dragCoefficient]. */
+export const MAT_PROPS_STRIDE = 2
 /** Bend-constraint f32 sections (buffer `bf`). */
 export const BF = { restAngle: 0, compliance: 1, zeta: 2, lambda: 3, angle: 4, COUNT: 5 } as const
 /** Bend-constraint u32 sections (buffer `bu`). */
@@ -104,7 +128,7 @@ export const UNIFORM_FIELDS: readonly (readonly [string, 'u32' | 'f32'])[] = [
   ['terrCount', 'u32'],
   ['distCap', 'u32'],
   ['bendCap', 'u32'],
-  ['padU', 'u32'],
+  ['colN', 'u32'],
   ['dt', 'f32'],
   ['h', 'f32'],
   ['gravity', 'f32'],
@@ -163,7 +187,13 @@ export const UNIFORM_FIELDS: readonly (readonly [string, 'u32' | 'f32'])[] = [
   ['memAabbX1', 'f32'],
   ['memAabbY1', 'f32'],
   ['viscEverySub', 'u32'],
-  ['padV', 'u32'],
+  /** Column field geometry + coupling-force constants (see CA/CF). */
+  ['colX0', 'f32'],
+  ['colInvRes', 'f32'],
+  ['colRes', 'f32'],
+  /** Hydrostatic sample offset: max(1.5 * resolution, 1.0). */
+  ['hydroOff', 'f32'],
+  ['maxObjBuoy', 'f32'],
 ] as const
 
 export const UNIFORM_BYTES = Math.ceil((UNIFORM_FIELDS.length * 4) / 16) * 16

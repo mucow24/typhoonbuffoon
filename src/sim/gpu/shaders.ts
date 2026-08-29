@@ -1,4 +1,4 @@
-import { BF, BU, CL_HEADER_F, DF, DU, FC, FX, PF, PU, uniformStructWgsl } from './layout'
+import { BF, BU, CA, CF, CL_HEADER_F, DF, DU, FC, FORCE_FP, FRC, FX, PF, PU, uniformStructWgsl } from './layout'
 
 /**
  * WGSL kernels for the GPU solver - transcriptions of the CPU reference
@@ -73,6 +73,8 @@ const DF_ZETA = ${DF.zeta}u; const DF_LAMBDA = ${DF.lambda}u;
 const DF_STRAIN = ${DF.strain}u;
 const DU_A = ${DU.a}u; const DU_B = ${DU.b}u; const DU_MAT = ${DU.mat}u;
 const DU_NOCOL1 = ${DU.noCol1}u; const DU_ALIVE = ${DU.alive}u;
+const DU_UNBREAK = ${DU.unbreakable}u;
+const AFP: f32 = ${FORCE_FP}.0;
 
 const BF_RESTANGLE = ${BF.restAngle}u; const BF_COMPLIANCE = ${BF.compliance}u;
 const BF_ZETA = ${BF.zeta}u; const BF_LAMBDA = ${BF.lambda}u;
@@ -1035,7 +1037,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
  * solveMemberContacts). Per (member, particle) exactly one contact from the
  * closest point on the full segment - what the CPU's sample-point walk with
  * the stamp dedupe computes. Endpoint reactions scatter in fixed point.
- * Bindings: uni, pf, pu, df, du, fx, fc, matSec.
+ * Bindings: uni, pf, pu, df, du, fx, fc, matProps.
  */
 export const SRC_CONTACTS_MEMBER = /* wgsl */ `
 @group(0) @binding(0) var<uniform> U: UStruct;
@@ -1045,7 +1047,7 @@ export const SRC_CONTACTS_MEMBER = /* wgsl */ `
 @group(0) @binding(4) var<storage, read_write> du: array<u32>;
 @group(0) @binding(5) var<storage, read_write> fx: array<atomic<i32>>;
 @group(0) @binding(6) var<storage, read_write> fc: array<atomic<u32>>;
-@group(0) @binding(7) var<storage, read_write> matSec: array<f32>;
+@group(0) @binding(7) var<storage, read_write> matProps: array<f32>;
 ${COMMON}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -1082,7 +1084,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let bx = pf[pf_i(PF_POSX, ib)];
     let by = pf[pf_i(PF_POSY, ib)];
     let mat = du[du_i(DU_MAT, m)];
-    let radius = max(matSec[mat] * 0.5, U.spacing * 0.75);
+    let radius = max(matProps[mat * 2u] * 0.5, U.spacing * 0.75);
     let reach = radius + rj;
     // Per-member AABB reject.
     if (xj < min(ax, bx) - reach || xj > max(ax, bx) + reach) { continue; }
@@ -1509,8 +1511,297 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `
 
+/**
+ * Column-field helpers - for kernels that bind colF. Mirrors sim/water.ts
+ * surfaceAt / velocityAt / submergedFraction exactly; -1e30 is the "dry"
+ * sentinel standing in for the CPU's -Infinity.
+ */
+const COL_FNS = /* wgsl */ `
+fn col_of(x: f32) -> i32 { return i32(floor((x - U.colX0) * U.colInvRes)); }
+fn surface_at(x: f32) -> f32 {
+  let c = col_of(x);
+  if (c < 0 || c >= i32(U.colN)) { return -1.0e30; }
+  return colF[${CF.surface}u * U.colN + u32(c)];
+}
+fn col_vel(x: f32) -> vec2f {
+  let c = col_of(x);
+  if (c < 0 || c >= i32(U.colN)) { return vec2f(0.0, 0.0); }
+  return vec2f(colF[${CF.velX}u * U.colN + u32(c)], colF[${CF.velY}u * U.colN + u32(c)]);
+}
+fn submerged_frac(x: f32, y: f32, r: f32) -> f32 {
+  let s = surface_at(x);
+  if (s < -1.0e29) { return 0.0; }
+  let depth = s - (y - r);
+  if (depth <= 0.0) { return 0.0; }
+  let span = 2.0 * r;
+  return select(depth / span, 1.0, depth >= span);
+}
+`
+
+/** Reset the column accumulators and field. Bindings: uni, colA, colF. */
+export const SRC_COL_CLEAR = /* wgsl */ `
+@group(0) @binding(0) var<uniform> U: UStruct;
+@group(0) @binding(1) var<storage, read_write> colA: array<atomic<i32>>;
+@group(0) @binding(2) var<storage, read_write> colF: array<f32>;
+${COMMON}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let c = gid.x;
+  if (c >= U.colN) { return; }
+  atomicStore(&colA[${CA.count}u * U.colN + c], 0);
+  atomicStore(&colA[${CA.floorFP}u * U.colN + c], 2147483647);
+  atomicStore(&colA[${CA.velXFP}u * U.colN + c], 0);
+  atomicStore(&colA[${CA.velYFP}u * U.colN + c], 0);
+  colF[${CF.surface}u * U.colN + c] = -1.0e30;
+  colF[${CF.velX}u * U.colN + c] = 0.0;
+  colF[${CF.velY}u * U.colN + c] = 0.0;
+}
+`
+
+/** Scatter fluid particles into their columns (water.ts build loop):
+ *  count, velocity sum (FORCE_FP), column floor (position-grade FP min).
+ *  Bindings: uni, pf, pu, colA. */
+export const SRC_COL_ACCUM = /* wgsl */ `
+@group(0) @binding(0) var<uniform> U: UStruct;
+@group(0) @binding(1) var<storage, read_write> pf: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pu: array<u32>;
+@group(0) @binding(3) var<storage, read_write> colA: array<atomic<i32>>;
+${COMMON}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= U.n) { return; }
+  if (pu[pu_i(PU_ALIVE, i)] != 1u) { return; }
+  if (pu[pu_i(PU_KIND, i)] != KIND_FLUID) { return; }
+  let c = i32(floor((pf[pf_i(PF_POSX, i)] - U.colX0) * U.colInvRes));
+  if (c < 0 || c >= i32(U.colN)) { return; }
+  let cu = u32(c);
+  atomicAdd(&colA[${CA.count}u * U.colN + cu], 1);
+  atomicAdd(&colA[${CA.velXFP}u * U.colN + cu], i32(pf[pf_i(PF_VELX, i)] * AFP));
+  atomicAdd(&colA[${CA.velYFP}u * U.colN + cu], i32(pf[pf_i(PF_VELY, i)] * AFP));
+  atomicMin(&colA[${CA.floorFP}u * U.colN + cu], i32(pf[pf_i(PF_POSY, i)] * U.fpScale));
+}
+`
+
+/** Surface from column VOLUME, not the topmost particle (water.ts:64-79 -
+ *  spray must not define the waterline), plus the mean column velocity.
+ *  Bindings: uni, colA, colF. */
+export const SRC_COL_SURFACE = /* wgsl */ `
+@group(0) @binding(0) var<uniform> U: UStruct;
+@group(0) @binding(1) var<storage, read_write> colA: array<i32>;
+@group(0) @binding(2) var<storage, read_write> colF: array<f32>;
+${COMMON}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let c = gid.x;
+  if (c >= U.colN) { return; }
+  let k = colA[${CA.count}u * U.colN + c];
+  if (k < 3) { return; } // stays at the dry sentinel
+  let depth = f32(k) * (U.spacing * U.spacing) * U.colInvRes;
+  let floorY = f32(colA[${CA.floorFP}u * U.colN + c]) * U.invFp;
+  colF[${CF.surface}u * U.colN + c] = floorY + depth;
+  let inv = 1.0 / (f32(k) * AFP);
+  colF[${CF.velX}u * U.colN + c] = f32(colA[${CA.velXFP}u * U.colN + c]) * inv;
+  colF[${CF.velY}u * U.colN + c] = f32(colA[${CA.velYFP}u * U.colN + c]) * inv;
+}
+`
+
+/** One smoothing pass so a choppy surface does not make lift chatter -
+ *  SEQUENTIAL and in place, matching the CPU's ascending in-place loop
+ *  (water.ts:81-98) where a column's smooth reads the already-smoothed
+ *  left neighbour. ~120 columns; one thread, like gridScan2.
+ *  Bindings: uni, colF. */
+export const SRC_COL_SMOOTH = /* wgsl */ `
+@group(0) @binding(0) var<uniform> U: UStruct;
+@group(0) @binding(1) var<storage, read_write> colF: array<f32>;
+${COMMON}
+@compute @workgroup_size(1)
+fn main() {
+  if (U.colN < 3u) { return; }
+  for (var c = 1u; c < U.colN - 1u; c++) {
+    let b = colF[${CF.surface}u * U.colN + c];
+    if (b < -1.0e29) { continue; }
+    var sum = b;
+    var k = 1.0;
+    let a = colF[${CF.surface}u * U.colN + c - 1u];
+    if (a > -1.0e29) { sum += a; k += 1.0; }
+    let d = colF[${CF.surface}u * U.colN + c + 1u];
+    if (d > -1.0e29) { sum += d; k += 1.0; }
+    colF[${CF.surface}u * U.colN + c] = sum / k;
+  }
+}
+`
+
+/**
+ * Member coupling forces, per distance constraint: hydrostatic wall load
+ * (world.ts applyHydrostaticLoad - horizontal only, the vertical pressure
+ * difference IS buoyancy) and quadratic water drag (applyWaterDrag - the
+ * impulse cap keeps light nodes from overshooting the shared velocity).
+ * Guards mirror the CPU exactly: joinery (unbreakable, zero-rest) carries
+ * no wall area and catches no drag. Endpoint accelerations scatter into
+ * frc in FORCE_FP fixed point; forcesApply resolves them.
+ * Bindings: uni, pf, pu, df, du, frc, matProps, colF.
+ */
+export const SRC_FORCES_MEMBER = /* wgsl */ `
+@group(0) @binding(0) var<uniform> U: UStruct;
+@group(0) @binding(1) var<storage, read_write> pf: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pu: array<u32>;
+@group(0) @binding(3) var<storage, read_write> df: array<f32>;
+@group(0) @binding(4) var<storage, read_write> du: array<u32>;
+@group(0) @binding(5) var<storage, read_write> frc: array<atomic<i32>>;
+@group(0) @binding(6) var<storage, read_write> matProps: array<f32>;
+@group(0) @binding(7) var<storage, read_write> colF: array<f32>;
+${COMMON}
+${COL_FNS}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let m = gid.x;
+  if (m >= U.distHW) { return; }
+  if (du[du_i(DU_ALIVE, m)] != 1u) { return; }
+  if (du[du_i(DU_UNBREAK, m)] == 1u) { return; }
+  let rest = df[df_i(DF_REST, m)];
+  if (rest <= 1e-6) { return; }
+  let ia = du[du_i(DU_A, m)];
+  let ib = du[du_i(DU_B, m)];
+  let wa = pf[pf_i(PF_INVMASS, ia)];
+  let wb = pf[pf_i(PF_INVMASS, ib)];
+  if (wa == 0.0 && wb == 0.0) { return; }
+
+  let ax = pf[pf_i(PF_POSX, ia)];
+  let ay = pf[pf_i(PF_POSY, ia)];
+  let bx = pf[pf_i(PF_POSX, ib)];
+  let by = pf[pf_i(PF_POSY, ib)];
+  let midX = (ax + bx) * 0.5;
+  let midY = (ay + by) * 0.5;
+
+  // Per-endpoint force shares (before the endpoint's own invMass).
+  var fxA = 0.0;
+  var fyA = 0.0;
+  var fxB = 0.0;
+  var fyB = 0.0;
+
+  // Hydrostatic wall load - horizontal only.
+  let vertical = abs(by - ay);
+  if (vertical >= 0.05) {
+    let rhoG = U.waterDensity * (-U.gravity);
+    let sL = surface_at(midX - U.hydroOff);
+    let sR = surface_at(midX + U.hydroOff);
+    let pL = select(0.0, max(0.0, rhoG * (sL - midY)), sL > -1.0e29);
+    let pR = select(0.0, max(0.0, rhoG * (sR - midY)), sR > -1.0e29);
+    let net = pL - pR;
+    if (net != 0.0) {
+      let fx = net * vertical;
+      fxA += fx * 0.5;
+      fxB += fx * 0.5;
+    }
+  }
+
+  // Quadratic drag against the local column flow.
+  let mat = du[du_i(DU_MAT, m)];
+  let section = matProps[mat * 2u];
+  let submerged = submerged_frac(midX, midY, section * 0.5);
+  if (submerged > 0.01) {
+    let cv = col_vel(midX);
+    let relX = cv.x - (pf[pf_i(PF_VELX, ia)] + pf[pf_i(PF_VELX, ib)]) * 0.5;
+    let relY = cv.y - (pf[pf_i(PF_VELY, ia)] + pf[pf_i(PF_VELY, ib)]) * 0.5;
+    let relSpeed = sqrt(relX * relX + relY * relY);
+    let ex = bx - ax;
+    let ey = by - ay;
+    let len = sqrt(ex * ex + ey * ey);
+    if (relSpeed >= 1e-6 && len >= 1e-9) {
+      let dirX = relX / relSpeed;
+      let dirY = relY / relSpeed;
+      let cross = abs((ex * dirY - ey * dirX) / len);
+      let frontal = rest * cross + section;
+      var force = 0.5 * U.waterDensity * matProps[mat * 2u + 1u] * frontal * relSpeed * relSpeed * submerged;
+      // Drag may slow relative motion, never reverse it (world.ts:467-472).
+      let massAB = select(0.0, 1.0 / wa, wa > 0.0) + select(0.0, 1.0 / wb, wb > 0.0);
+      let maxForce = massAB * relSpeed / U.dt;
+      force = min(force, maxForce);
+      fxA += force * dirX * 0.5;
+      fyA += force * dirY * 0.5;
+      fxB += force * dirX * 0.5;
+      fyB += force * dirY * 0.5;
+    }
+  }
+
+  if (wa > 0.0 && (fxA != 0.0 || fyA != 0.0)) {
+    atomicAdd(&frc[${FRC.accX}u * U.cap + ia], i32(fxA * wa * AFP));
+    atomicAdd(&frc[${FRC.accY}u * U.cap + ia], i32(fyA * wa * AFP));
+  }
+  if (wb > 0.0 && (fxB != 0.0 || fyB != 0.0)) {
+    atomicAdd(&frc[${FRC.accX}u * U.cap + ib], i32(fxB * wb * AFP));
+    atomicAdd(&frc[${FRC.accY}u * U.cap + ib], i32(fyB * wb * AFP));
+  }
+}
+`
+
+/**
+ * Resolve the member force scatters and add per-particle buoyancy
+ * (world.ts applyBuoyancy): analytic lift from REST volume, wetness-gated
+ * and accel-capped for object particles. Runs AFTER census (PU_WET) and
+ * the column pass, BEFORE the substeps consume accX/accY. Also clears frc
+ * behind itself for the next frame.
+ * Bindings: uni, pf, pu, frc, colF.
+ */
+export const SRC_FORCES_APPLY = /* wgsl */ `
+@group(0) @binding(0) var<uniform> U: UStruct;
+@group(0) @binding(1) var<storage, read_write> pf: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pu: array<u32>;
+@group(0) @binding(3) var<storage, read_write> frc: array<i32>;
+@group(0) @binding(4) var<storage, read_write> colF: array<f32>;
+${COMMON}
+${COL_FNS}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= U.n) { return; }
+  let rawX = frc[${FRC.accX}u * U.cap + i];
+  let rawY = frc[${FRC.accY}u * U.cap + i];
+  frc[${FRC.accX}u * U.cap + i] = 0;
+  frc[${FRC.accY}u * U.cap + i] = 0;
+  if (pu[pu_i(PU_ALIVE, i)] != 1u) { return; }
+  let w = pf[pf_i(PF_INVMASS, i)];
+  if (w == 0.0) { return; }
+
+  var addX = f32(rawX) / AFP;
+  var addY = f32(rawY) / AFP;
+
+  let kind = pu[pu_i(PU_KIND, i)];
+  let vol = pf[pf_i(PF_VOLUME, i)];
+  if (kind != KIND_FLUID && vol > 0.0) {
+    var frac = submerged_frac(pf[pf_i(PF_POSX, i)], pf[pf_i(PF_POSY, i)], pf[pf_i(PF_RADIUS, i)]);
+    if (frac > 0.0) {
+      let g = -U.gravity;
+      if (kind == KIND_OBJECT) {
+        // Wetness-gated: below the waterline says "maybe"; actual fluid
+        // contact says "in water" (world.ts:315-323). Freshly from THIS
+        // frame's census - the whole point of computing forces on-device.
+        frac *= min(1.0, f32(pu[pu_i(PU_WET, i)]) / 8.0);
+        if (frac > 0.0) {
+          addY += min(g * (U.waterDensity * vol * w) * frac, U.maxObjBuoy);
+        }
+      } else {
+        addY += g * (U.waterDensity * vol * w) * frac;
+      }
+    }
+  }
+
+  if (addX != 0.0 || addY != 0.0) {
+    pf[pf_i(PF_ACCX, i)] += addX;
+    pf[pf_i(PF_ACCY, i)] += addY;
+  }
+}
+`
+
 /** Names -> sources, for pipeline creation. */
 export const KERNELS = {
+  colClear: SRC_COL_CLEAR,
+  colAccum: SRC_COL_ACCUM,
+  colSurface: SRC_COL_SURFACE,
+  colSmooth: SRC_COL_SMOOTH,
+  forcesMember: SRC_FORCES_MEMBER,
+  forcesApply: SRC_FORCES_APPLY,
   gridClear: SRC_GRID_CLEAR,
   packGather: SRC_PACK_GATHER,
   gridCount: SRC_GRID_COUNT,

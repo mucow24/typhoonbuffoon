@@ -370,12 +370,13 @@ describe('SimHost', () => {
     // is exactly how it shipped, twice. This test drives the real host loop
     // on a real wall clock against a fence just inside the depth-2 budget
     // and fails unless the loop keeps stepping while fences are in flight.
-    // The fence here must stay INSIDE ~33 ms: pipeline depth is FORCE LAG
-    // (host-computed buoyancy acts frames late), and depth 4 - tried for
-    // fence headroom - resonance-pumped a floating crate into the sky.
-    // Longer fences are paid with honest slow-mo, not with depth.
+    // Depth was once capped at 2 by FORCE LAG (host-computed buoyancy
+    // acting frames late resonance-pumped a floating crate at depth 4).
+    // The coupling forces are in-kernel now (ownsCouplingForces), so the
+    // readback feeds only lag-tolerant consumers and depth 3 buys the
+    // fence budget a loaded iGPU needs (~35 ms fences at 24k particles).
     const { host } = makeHost()
-    const FENCE_MS = 30
+    const FENCE_MS = 45
     const inFlight: number[] = [] // readyAt timestamps, oldest first
     let steps = 0
     const consumeReady = () => {
@@ -401,7 +402,7 @@ describe('SimHost', () => {
       // changes, this fake and this test define the latency it must hide.
       reap: async () => {
         consumeReady()
-        if (inFlight.length >= 2) await awaitFront()
+        if (inFlight.length >= 3) await awaitFront()
       },
     }
     host.enqueue({ type: 'togglePause' })
@@ -461,6 +462,35 @@ describe('SimHost', () => {
     // Steps 2+ of the burst tick must be preceded by a FLUSH, not a reap.
     const burstPre = perStep.slice(2)
     expect(burstPre.every((p) => p === 'flush')).toBe(true)
+  })
+
+  it('pipelines catch-up bursts for a backend that owns coupling forces', async () => {
+    // The burst flush exists for FORCE freshness: host-computed buoyancy
+    // must not act on the same stale state twice. A backend that computes
+    // the coupling forces in-kernel (device-fresh every frame) has nothing
+    // to flush FOR - forcing it to flush would re-serialize catch-up on the
+    // fence, deepening slow-mo for no physics gain. Everything else the
+    // readback feeds (damage, spawn guards, snapshots) tolerates lag.
+    const { host } = makeHost()
+    const calls: string[] = []
+    const solver = {
+      sync: () => {},
+      step: () => calls.push('step'),
+      readback: async () => {
+        calls.push('flush')
+      },
+      reap: async () => {
+        calls.push('reap')
+      },
+      ownsCouplingForces: true,
+    }
+    host.sim.solver = solver
+    host.enqueue({ type: 'togglePause' })
+    host.start(0)
+    await host.tick(1000 / 60)
+    await host.tick(1000 / 60 + 50) // owes a 3-step burst
+    expect(calls.filter((c) => c === 'step').length).toBeGreaterThanOrEqual(4)
+    expect(calls).not.toContain('flush')
   })
 
   it('reset restores the play snapshot and pauses', async () => {

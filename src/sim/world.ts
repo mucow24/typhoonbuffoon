@@ -237,9 +237,16 @@ export class SimWorld {
       this.fluid.spacing * this.fluid.spacing,
     )
     lap('waterField')
-    this.applyBuoyancy()
-    this.applyHydrostaticLoad()
-    this.applyWaterDrag(dt)
+    // Water-coupling forces run WHERE the freshest state is: the CPU
+    // reference computes them here; a backend that owns them (GPU) computes
+    // them in-kernel from device state, and applying them here too would
+    // double the force. The column field itself still builds every frame -
+    // wind exposure, conditions and probes read it host-side either way.
+    if (!this.solver.ownsCouplingForces) {
+      this.applyBuoyancy()
+      this.applyHydrostaticLoad()
+      this.applyWaterDrag(dt)
+    }
     this.wind.advance(dt)
     this.applyWind()
     lap('forces')
