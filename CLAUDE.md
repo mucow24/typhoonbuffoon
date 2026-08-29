@@ -29,11 +29,15 @@ Only the outermost layer that cannot be exercised without a browser:
 | `src/ui/*` | DOM panel construction. |
 | `src/input/*`, `src/editor/tools.ts` | Pointer and key event plumbing. |
 | `src/main.ts`, `src/app.ts` | Composition root and wiring. |
+| `src/runtime/worker.ts` | The Worker global shell: wires `self` to SimHost, nothing else may live here. |
 
 Everything under `src/sim/`, `src/game/`, `src/model/`, `src/world/`,
-`src/core/`, `src/scenes/` is testable and must be tested. Geometry and
-transform *maths* is testable even when the drawing around it is not:
-`src/render/camera.ts` is NOT exempt.
+`src/core/`, `src/scenes/` is testable and must be tested. So is the worker
+boundary: `src/runtime/host.ts`, `client.ts`, `snapshot.ts`, and
+`src/editor/viewModel.ts` are plain classes and pure functions, tested in
+Node over a loopback wire (`test/runtime/`) - only the five-line worker
+shell is exempt. Geometry and transform *maths* is testable even when the
+drawing around it is not: `src/render/camera.ts` is NOT exempt.
 
 ### Why this exists
 
@@ -70,8 +74,15 @@ confidence.
 
 ```
 npm run dev        # vite dev server
-npm test           # vitest, watch
-npm run test:run   # vitest, single pass
+npm test           # vitest watch, unit project (Node, CPU reference)
+npm run test:run   # unit project, single pass
+npm run test:gpu   # GPU project: WebGPU kernel/parity/throughput, real browser
+npm run test:all   # both projects
 npm run typecheck  # tsc --noEmit
 npm run build      # typecheck + production build
 ```
+
+The GPU project needs a WebGPU-capable machine and fails loudly (never
+skips) without one. Run it whenever `src/sim/gpu/**`, the solver seam, or
+anything the parity scenes exercise changes; the unit project alone cannot
+see a broken kernel.

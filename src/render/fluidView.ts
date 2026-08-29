@@ -1,6 +1,7 @@
 import { Container, Graphics, Particle, ParticleContainer, type Renderer, type Texture } from 'pixi.js'
 import { KIND_FLUID } from '../sim/particles'
-import type { SimWorld } from '../sim/world'
+import { FLAG_ALIVE, kindOfFlags } from '../runtime/snapshot'
+import type { SimClient } from '../runtime/client'
 import type { Camera } from './camera'
 
 const TEX_SIZE = 32
@@ -8,12 +9,16 @@ const TEX_SIZE = 32
 const PARKED = 1e7
 
 /**
- * Fluid rendering via ParticleContainer.
+ * Fluid rendering via ParticleContainer, from snapshots.
  *
  * A Graphics redraw with thousands of circle() calls rebuilds its geometry
  * every frame and will not hold 60fps at the particle counts this game needs.
  * ParticleContainer batches a shared texture into one draw call, which is the
  * difference between a few thousand particles being affordable and not.
+ *
+ * Positions are interpolated between the last two snapshots: sim frames are
+ * not phase-locked to rAF, and at heavy particle counts the sim deliberately
+ * runs slower than render - exactly when smooth drawing matters most.
  */
 export class FluidView {
   readonly container: ParticleContainer
@@ -21,7 +26,7 @@ export class FluidView {
   private readonly texture: Texture
   private shown = 0
 
-  constructor(parent: Container, renderer: Renderer, private readonly sim: SimWorld) {
+  constructor(parent: Container, renderer: Renderer, private readonly client: SimClient) {
     const g = new Graphics().circle(TEX_SIZE / 2, TEX_SIZE / 2, TEX_SIZE / 2 - 1).fill(0xffffff)
     this.texture = renderer.generateTexture({
       target: g,
@@ -38,18 +43,36 @@ export class FluidView {
   update(camera: Camera, viewW: number, viewH: number): void {
     camera.applyTo(this.container, 1, viewW, viewH)
 
-    const p = this.sim.particles
-    const alive = p.slots.alive
+    const snap = this.client.latest
+    if (!snap) return
+    const body = snap.body
+    const prev = this.client.previous?.body ?? null
+    const alpha = this.client.renderAlpha()
+    const nBoth = prev ? Math.min(body.particleCount, prev.particleCount) : 0
+
     // Slight overlap so the surface reads as a body of water rather than beads.
-    const drawSize = this.sim.fluid.spacing * 1.7
+    const drawSize = snap.scalars.fluidSpacing * 1.7
     const scale = drawSize / TEX_SIZE
 
     let n = 0
-    for (let i = 0; i < p.highWater; i++) {
-      if (alive[i] !== 1 || p.kind[i] !== KIND_FLUID) continue
+    for (let i = 0; i < body.particleCount; i++) {
+      const flags = body.flags[i]!
+      if ((flags & FLAG_ALIVE) === 0 || kindOfFlags(flags) !== KIND_FLUID) continue
+      let x = body.posX[i]!
+      let y = body.posY[i]!
+      if (prev && i < nBoth && prev.flags[i] === flags) {
+        const px = prev.posX[i]!
+        const py = prev.posY[i]!
+        // A recycled slot may hold a different particle in the two snapshots;
+        // a teleport-length lerp gives it away. Snap to current instead.
+        if ((px - x) * (px - x) + (py - y) * (py - y) < 4) {
+          x = px + (x - px) * alpha
+          y = py + (y - py) * alpha
+        }
+      }
       const particle = this.ensure(n)
-      particle.x = p.posX[i]!
-      particle.y = p.posY[i]!
+      particle.x = x
+      particle.y = y
       particle.scaleX = scale
       particle.scaleY = scale
       n++

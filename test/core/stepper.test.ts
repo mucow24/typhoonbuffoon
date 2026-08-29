@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { GameLoop } from '../../src/core/loop'
+import { FixedStepper } from '../../src/core/stepper'
 
 /**
  * The fixed-timestep accumulator, at its worst moment.
@@ -15,13 +15,13 @@ import { GameLoop } from '../../src/core/loop'
 
 function makeLoop(opts: { maxCatchUpSteps?: number } = {}) {
   let steps = 0
-  const loop = new GameLoop({
+  const loop = new FixedStepper({
     fixedHz: 60,
     ...opts,
     fixedUpdate: () => {
       steps++
     },
-    render: () => {},
+    frameEnd: () => {},
   })
   return { loop, stepCount: () => steps }
 }

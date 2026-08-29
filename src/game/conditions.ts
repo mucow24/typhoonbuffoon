@@ -53,6 +53,9 @@ export class Conditions {
     this.wavePhase = 0
     this.sim.wind.baseSpeed = 0
     this.sim.wind.reset()
+    // update() only runs while the sim does; a paused reset must not leave a
+    // stale paddle armed in the solver.
+    this.sim.waveDrive = null
   }
 
   /** 0..1 overall severity, used to grey the sky. */
@@ -247,10 +250,17 @@ export class Conditions {
    * Waves: a paddle at the seaward edge. Driving the water rather than moving
    * structures directly means everything downstream - shoving a raft, breaking
    * over a wall - falls out of the fluid rather than needing its own code.
+   *
+   * This computes the paddle; the SOLVER applies it (SimWorld.waveDrive),
+   * because the blend mutates velocities and the GPU backend owns those
+   * device-side. Frame-level either way, same oscillator, same 0.08 blend.
    */
   private driveWaves(dt: number): void {
     const strength = WAVE_LEVELS[this.waveStrength]
-    if (strength <= 0) return
+    if (strength <= 0) {
+      this.sim.waveDrive = null
+      return
+    }
 
     const period = 6.5 - strength * 2.5
     this.wavePhase += (dt / period) * Math.PI * 2
@@ -262,14 +272,8 @@ export class Conditions {
     const sin = Math.sin(this.wavePhase)
     const push = sin < 0 ? sin * amplitude : sin * amplitude * 0.55
 
-    const p = this.sim.particles
-    const zoneX = this.field.right - 8
-    for (let i = 0; i < p.highWater; i++) {
-      if (p.slots.alive[i] !== 1 || p.kind[i] !== KIND_FLUID) continue
-      if (p.posX[i]! < zoneX) continue
-      // Blend rather than set, so the paddle nudges the water instead of
-      // teleporting its velocity and injecting a shock.
-      p.velX[i]! += (push - p.velX[i]!) * 0.08
-    }
+    // Blend rather than set, so the paddle nudges the water instead of
+    // teleporting its velocity and injecting a shock.
+    this.sim.waveDrive = { x0: this.field.right - 8, push, blend: 0.08 }
   }
 }

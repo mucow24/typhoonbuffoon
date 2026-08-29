@@ -1,7 +1,5 @@
 import type { Camera } from '../render/camera'
-import type { Session } from '../game/session'
 import type { MaterialId } from '../sim/materials'
-import type { Field } from '../world/field'
 import type { Vec2 } from '../core/math'
 
 export type ToolName = 'pan' | 'build' | 'anchor' | 'object' | 'delete' | 'water'
@@ -21,9 +19,42 @@ export interface ViewSize {
 }
 
 /**
- * Build-mode mouse handling. Everything it does goes through the Session, so
- * edits land in the document and the live sim together - which is what makes
- * building during the sim work rather than being a special case.
+ * Everything the editor needs from the far side of the worker boundary.
+ * Picks and positions answer synchronously from the latest snapshot's
+ * structure view-model (at most one sim frame old); mutations are
+ * fire-and-forget commands whose results come back in the next snapshot.
+ * Implemented in app.ts over SimClient + editor/viewModel.ts.
+ */
+export interface EditorGateway {
+  pickNode(x: number, y: number, radius: number): string | null
+  pickMember(x: number, y: number, radius: number): string | null
+  pickAnchor(x: number, y: number, radius: number): string | null
+  pickObject(x: number, y: number): string | null
+  nodePosition(id: string): Vec2 | null
+  groundHeight(x: number): number
+  buildMember(
+    fromNode: string | null,
+    from: Vec2,
+    toNode: string | null,
+    to: Vec2,
+    material: MaterialId,
+  ): void
+  addAnchor(x: number, y: number, attachedTo: string | null): void
+  addObject(x: number, y: number, width: number, height: number, density: number): void
+  removeMember(id: string): void
+  removeAnchor(id: string): void
+  removeObject(id: string): void
+  undo(): void
+  redo(): void
+  splash(x: number, y: number): void
+  setStream(x: number, y: number): void
+  clearStream(): void
+}
+
+/**
+ * Build-mode mouse handling. Everything it does goes through the gateway, so
+ * edits land in the worker's document and live sim together - which is what
+ * makes building during the sim work rather than being a special case.
  */
 export class EditorController {
   tool: ToolName = 'build'
@@ -44,11 +75,7 @@ export class EditorController {
   hoverNode: string | null = null
   hoverMember: string | null = null
 
-  /** Fired on water-tool click; the splash works even while paused. */
-  onWaterSplash: ((x: number, y: number) => void) | null = null
   private waterHeld = false
-  private readonly waterPos: Vec2 = { x: 0, y: 0 }
-
   private dragging = false
   private dragFrom: Vec2 = { x: 0, y: 0 }
   private dragFromNode: string | null = null
@@ -58,8 +85,7 @@ export class EditorController {
     private readonly element: HTMLElement,
     private readonly camera: Camera,
     private readonly view: ViewSize,
-    private readonly session: Session,
-    private readonly field: Field,
+    private readonly gateway: EditorGateway,
   ) {
     this.on('pointerdown', this.onDown as EventListener)
     this.on('pointermove', this.onMove as EventListener, window)
@@ -111,9 +137,9 @@ export class EditorController {
     switch (this.tool) {
       case 'build': {
         this.dragging = true
-        this.dragFromNode = this.session.pickNode(world.x, world.y, snap)
+        this.dragFromNode = this.gateway.pickNode(world.x, world.y, snap)
         const at = this.dragFromNode
-          ? this.session.nodePosition(this.dragFromNode)!
+          ? this.gateway.nodePosition(this.dragFromNode) ?? this.applyGrid(world)
           : this.applyGrid(world)
         this.dragFrom = at
         this.preview.kind = 'member'
@@ -126,9 +152,9 @@ export class EditorController {
       case 'anchor': {
         // Dropping an anchor on an object binds it to that object; a structure
         // attached to it then genuinely holds the object up.
-        const objectId = this.session.pickObject(world.x, world.y)
+        const objectId = this.gateway.pickObject(world.x, world.y)
         const at = objectId ? world : this.snapToGround(world)
-        this.session.addAnchor(at.x, at.y, objectId)
+        this.gateway.addAnchor(at.x, at.y, objectId)
         break
       }
 
@@ -143,27 +169,26 @@ export class EditorController {
 
       case 'water': {
         this.waterHeld = true
-        this.waterPos.x = world.x
-        this.waterPos.y = world.y
-        this.onWaterSplash?.(world.x, world.y)
+        this.gateway.splash(world.x, world.y)
+        this.gateway.setStream(world.x, world.y)
         break
       }
 
       case 'delete': {
         // Most specific first: a member is a thin target, an object a large
         // one, so picking the object first would make members unclickable.
-        const member = this.session.pickMember(world.x, world.y, snap)
+        const member = this.gateway.pickMember(world.x, world.y, snap)
         if (member) {
-          this.session.removeMember(member)
+          this.gateway.removeMember(member)
           break
         }
-        const anchor = this.session.pickAnchor(world.x, world.y, snap * 1.5)
+        const anchor = this.gateway.pickAnchor(world.x, world.y, snap * 1.5)
         if (anchor) {
-          this.session.removeAnchor(anchor)
+          this.gateway.removeAnchor(anchor)
           break
         }
-        const object = this.session.pickObject(world.x, world.y)
-        if (object) this.session.removeObject(object)
+        const object = this.gateway.pickObject(world.x, world.y)
+        if (object) this.gateway.removeObject(object)
         break
       }
     }
@@ -171,7 +196,7 @@ export class EditorController {
 
   /** Sit an anchor on the terrain surface if it was dropped near it. */
   private snapToGround(world: Vec2): Vec2 {
-    const ground = this.field.terrain.heightAt(world.x)
+    const ground = this.gateway.groundHeight(world.x)
     if (Math.abs(world.y - ground) < 2.5) return { x: world.x, y: ground }
     return this.applyGrid(world)
   }
@@ -181,19 +206,19 @@ export class EditorController {
     const world = this.toWorld(e)
     const snap = this.snapRadiusWorld()
 
-    this.hoverNode = this.session.pickNode(world.x, world.y, snap)
-    this.hoverMember = this.tool === 'delete' ? this.session.pickMember(world.x, world.y, snap) : null
+    this.hoverNode = this.gateway.pickNode(world.x, world.y, snap)
+    this.hoverMember =
+      this.tool === 'delete' ? this.gateway.pickMember(world.x, world.y, snap) : null
 
-    if (this.waterHeld) {
-      this.waterPos.x = world.x
-      this.waterPos.y = world.y
-    }
+    if (this.waterHeld) this.gateway.setStream(world.x, world.y)
 
     if (!this.dragging) return
 
     if (this.preview.kind === 'member') {
-      const targetNode = this.session.pickNode(world.x, world.y, snap)
-      const at = targetNode ? this.session.nodePosition(targetNode)! : this.applyGrid(world)
+      const targetNode = this.gateway.pickNode(world.x, world.y, snap)
+      const at = targetNode
+        ? this.gateway.nodePosition(targetNode) ?? this.applyGrid(world)
+        : this.applyGrid(world)
       this.preview.to = at
       this.preview.snappedTo = targetNode
       this.preview.valid =
@@ -207,30 +232,35 @@ export class EditorController {
     }
   }
 
-  /** Cursor position to stream water at while the water tool is held down. */
-  waterStream(): Vec2 | null {
-    return this.tool === 'water' && this.waterHeld ? this.waterPos : null
+  private releaseWater(): void {
+    if (!this.waterHeld) return
+    this.waterHeld = false
+    this.gateway.clearStream()
   }
 
   private onUp = (e: PointerEvent): void => {
-    if (e.button === 0) this.waterHeld = false
+    if (e.button === 0) this.releaseWater()
     if (e.button !== 0 || !this.dragging) return
     this.dragging = false
 
     if (this.preview.kind === 'member' && this.preview.valid) {
-      const a = this.preview.snappedFrom ?? this.session.addNode(this.dragFrom.x, this.dragFrom.y)
-      const b = this.preview.snappedTo ?? this.session.addNode(this.preview.to.x, this.preview.to.y)
-      this.session.addMember(a, b, this.material)
+      this.gateway.buildMember(
+        this.preview.snappedFrom,
+        this.dragFrom,
+        this.preview.snappedTo,
+        this.preview.to,
+        this.material,
+      )
     } else if (this.preview.kind === 'object' && this.preview.valid) {
       const x = (this.dragFrom.x + this.preview.to.x) * 0.5
       const y = (this.dragFrom.y + this.preview.to.y) * 0.5
-      this.session.addWorldObject({
+      this.gateway.addObject(
         x,
         y,
-        width: Math.abs(this.preview.to.x - this.dragFrom.x),
-        height: Math.abs(this.preview.to.y - this.dragFrom.y),
-        density: 400,
-      })
+        Math.abs(this.preview.to.x - this.dragFrom.x),
+        Math.abs(this.preview.to.y - this.dragFrom.y),
+        400,
+      )
     }
 
     this.preview.kind = 'none'
@@ -244,35 +274,26 @@ export class EditorController {
     const mod = e.ctrlKey || e.metaKey
     if (mod && e.key.toLowerCase() === 'z') {
       e.preventDefault()
-      if (e.shiftKey) this.session.redo()
-      else this.session.undo()
+      if (e.shiftKey) this.gateway.redo()
+      else this.gateway.undo()
       return
     }
-    switch (e.key) {
-      case '1':
-        this.tool = 'build'
-        break
-      case '2':
-        this.tool = 'anchor'
-        break
-      case '3':
-        this.tool = 'object'
-        break
-      case '4':
-        this.tool = 'delete'
-        break
-      case '5':
-        this.tool = 'pan'
-        break
-      case '6':
-        this.tool = 'water'
-        break
-      case 'q':
-        this.material = 'wood'
-        break
-      case 'w':
-        this.material = 'steel'
-        break
+    const tools: Record<string, ToolName> = {
+      '1': 'build',
+      '2': 'anchor',
+      '3': 'object',
+      '4': 'delete',
+      '5': 'pan',
+      '6': 'water',
     }
+    const next = tools[e.key]
+    if (next) {
+      // Switching away from the water tool mid-hold must stop the stream.
+      if (next !== 'water') this.releaseWater()
+      this.tool = next
+      return
+    }
+    if (e.key === 'q') this.material = 'wood'
+    else if (e.key === 'w') this.material = 'steel'
   }
 }

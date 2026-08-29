@@ -22,9 +22,11 @@ export interface ClusterFrame {
  */
 export class Cluster {
   readonly particles: Int32Array
-  private readonly restX: Float32Array
-  private readonly restY: Float32Array
-  private readonly mass: Float32Array
+  /** Rest offsets and cached masses: read by the GPU backend's upload
+   *  (sim/gpu/gpuSolver.ts) as well as solve(). Treat as immutable. */
+  readonly restX: Float32Array
+  readonly restY: Float32Array
+  readonly mass: Float32Array
   readonly totalMass: number
   /** 0..1. 1 holds shape hard; lower is squashier. */
   stiffness = 1

@@ -121,8 +121,12 @@ the solver reports strain, and it should land with the solver, not after.
 | UI | **Plain DOM overlay** | Editor panels are a palette, a budget readout, a play bar. A framework is friction at this stage. |
 | Data | **Struct-of-arrays typed arrays** for particles and nodes, from day one | Cheap now, expensive to retrofit, and the precondition for a worker/WASM/GPU move later. |
 
-Main thread to start. Move the solver behind a worker boundary when profiling demands it —
-the SoA layout makes that a transfer, not a rewrite.
+~~Main thread to start. Move the solver behind a worker boundary when profiling demands it —
+the SoA layout makes that a transfer, not a rewrite.~~ **Superseded (2026-08):
+profiling demanded it.** The sim ceiling measured ~4k particles at 60 Hz on a
+fast desktop core; the game core now moves behind a worker boundary and the
+particle pipeline onto WebGPU compute, with the CPU solver kept as the
+reference implementation. Architecture and phases: `docs/GPU_PLAN.md`.
 
 ### 5.2 The document/projection split
 
@@ -542,7 +546,7 @@ leaking wall reads as a bug rather than as a near miss.
 | Sound (creaks, snaps, groaning) | Additive | Solver emits strain-rate and break events |
 | Campaign, progression, win conditions | Sandbox first | `LevelDoc` has room |
 | Replay / slow-mo | Cheap later | Fixed timestep + seeded RNG make it nearly free |
-| Worker / WASM / GPU solver | Only if profiling demands it | SoA typed arrays from day one |
+| ~~Worker / WASM / GPU solver~~ | ~~Only if profiling demands it~~ profiling demanded it — see `docs/GPU_PLAN.md` | SoA typed arrays from day one |
 | Terrain erosion & destruction | Large scope | Terrain is already a polyline, not a bitmap |
 | Broken members turning into debris | Body-count cost | Physics objects exist from step 7; a break event just spawns one |
 | Deep genre teardown | Not blocking any code | Revisit before level design |
