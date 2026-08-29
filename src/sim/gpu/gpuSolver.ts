@@ -42,7 +42,30 @@ const HASH_MASK = (1 << KIND_FLUID) | (1 << KIND_OBJECT) | (1 << KIND_BOUNDARY)
  * 24k particles (idle fences are 17-21 ms; depth 2 stalled 24k at 37 Hz).
  * Raising this further trades snapshot/input latency, not physics.
  */
-const PIPELINE_DEPTH = 3
+const PIPELINE_DEPTH = 4
+
+/**
+ * Stage results for readback every Nth submit. Between staged frames the
+ * GPU chains device-side with no copies, no mapAsync and no fence on any
+ * path the sim rate can feel: the fence budget is READBACK_INTERVAL *
+ * PIPELINE_DEPTH frames (~133 ms) against fences measured up to ~60 ms on
+ * a hot, loaded iGPU. Host-visible state advances every Nth frame; the
+ * host emits snapshots on resultsVersion so the renderer interpolates a
+ * clean 30 Hz signal instead of judder, and readback()/flush stages a
+ * FRESH copy of device state on demand, so parity and stepAsync stay
+ * exact. Damage, spawn guards and probes read the Nth-frame cadence -
+ * all integrative or occupancy checks, all lag-tolerant.
+ */
+const READBACK_INTERVAL = 2
+
+/** What a staged frame needs to apply its results later. */
+interface FrameMeta {
+  n: number
+  distHW: number
+  bendHW: number
+  clusters: { cx: number; cy: number; angle: number }[]
+  capturedStamp: number
+}
 
 /** One submitted GPU frame whose results have not been consumed yet. */
 interface PendingFrame {
@@ -666,14 +689,45 @@ export class GpuSolver implements SolverBackend {
     }
     pass.end()
 
-    // Stage the frame's outputs for readback - into the HALF of the
-    // ping-pong pair that is not still mapped by the pending frame.
+    // Stage results only every READBACK_INTERVALth submit: between staged
+    // frames the device chains with no copies and no mapAsync, so no fence
+    // exists on any path the sim rate can feel. The frame's metadata is
+    // kept either way - readback() uses it to stage a FRESH copy of device
+    // state on demand (flush semantics for parity/stepAsync/backend swap).
+    this.lastMeta = {
+      n,
+      distHW: this.frameDistHW,
+      bendHW: this.frameBendHW,
+      clusters: this.liveClusters,
+      capturedStamp: this.capturedStamp,
+    }
+    const stageThis = this.submitCounter % READBACK_INTERVAL === 0
+    this.submitCounter++
+    if (stageThis) {
+      const rec = this.stageReadback(enc, this.lastMeta)
+      this.device.queue.submit([enc.finish()])
+      // Map starts NOW; it resolves whenever the GPU finishes AND the
+      // fence is observed - ~17-21 ms idle, up to ~60 ms hot and loaded
+      // (measured). The record joins the in-flight queue; the host reaps
+      // completed frames without ever waiting for the current one.
+      this.beginMap(rec)
+      this.pendingQ.push(rec)
+      this.lastSubmitStaged = true
+    } else {
+      this.device.queue.submit([enc.finish()])
+      this.lastSubmitStaged = false
+    }
+  }
+
+  /** Encode this frame's result copies into the next ring staging buffer. */
+  private stageReadback(enc: GPUCommandEncoder, meta: FrameMeta): PendingFrame {
     const st = this.stag!
     const staging = this.stagingPair[this.stagingFlip]!
     this.stagingFlip = (this.stagingFlip + 1) % (PIPELINE_DEPTH + 1)
     const cp = (src: GPUBuffer, srcOff: number, dstOff: number, words: number) => {
       if (words > 0) enc.copyBufferToBuffer(src, srcOff, staging, dstOff, words * 4)
     }
+    const n = meta.n
     cp(this.pf, PF.posX * this.cap * 4, st.posX, n)
     cp(this.pf, PF.posY * this.cap * 4, st.posY, n)
     cp(this.pf, PF.velX * this.cap * 4, st.velX, n)
@@ -682,28 +736,14 @@ export class GpuSolver implements SolverBackend {
     cp(this.pf, PF.wetVX * this.cap * 4, st.wetVX, n)
     cp(this.pf, PF.wetVY * this.cap * 4, st.wetVY, n)
     cp(this.pu, PU.wet * this.cap * 4, st.wet, n)
-    cp(this.df, DF.strain * this.distCap * 4, st.dStrain, this.frameDistHW)
-    cp(this.bf, BF.angle * this.bendCap * 4, st.bAngle, this.frameBendHW)
-    cp(this.clF, 0, st.clusterPose, this.liveClusters.length * CL_HEADER_F)
+    cp(this.df, DF.strain * this.distCap * 4, st.dStrain, meta.distHW)
+    cp(this.bf, BF.angle * this.bendCap * 4, st.bAngle, meta.bendHW)
+    cp(this.clF, 0, st.clusterPose, meta.clusters.length * CL_HEADER_F)
+    return { staging, stag: st, ...meta, state: 'pending', map: undefined as unknown as Promise<boolean> }
+  }
 
-    this.device.queue.submit([enc.finish()])
-
-    // Map starts NOW; it resolves whenever the GPU finishes AND the fence
-    // is observed - which real browsers take ~17-21 ms to do even for a
-    // 256-byte copy (measured). The record joins the in-flight queue; the
-    // host reaps completed frames without ever waiting for the current one.
-    const rec: PendingFrame = {
-      staging,
-      stag: st,
-      n,
-      distHW: this.frameDistHW,
-      bendHW: this.frameBendHW,
-      clusters: this.liveClusters,
-      capturedStamp: this.capturedStamp,
-      state: 'pending',
-      map: undefined as unknown as Promise<boolean>,
-    }
-    rec.map = staging.mapAsync(GPUMapMode.READ).then(
+  private beginMap(rec: PendingFrame): void {
+    rec.map = rec.staging.mapAsync(GPUMapMode.READ).then(
       () => {
         rec.state = 'ok'
         return true
@@ -713,7 +753,6 @@ export class GpuSolver implements SolverBackend {
         return false
       },
     )
-    this.pendingQ.push(rec)
   }
 
   // --------------------------------------------------------------- readback
@@ -722,6 +761,11 @@ export class GpuSolver implements SolverBackend {
    *  PIPELINE_DEPTH - see that constant for the measured latencies. */
   private pendingQ: PendingFrame[] = []
   private capturedStamp = 0
+  /** See SolverBackend.resultsVersion: bumped when results land in the SoA. */
+  resultsVersion = 0
+  private submitCounter = 0
+  private lastMeta: FrameMeta | null = null
+  private lastSubmitStaged = true
   /** Host-write horizon already on the device: sync() uploads pos/vel only
    *  for slots stamped after this. 0 = fresh device, upload everything. */
   private deviceStamp = 0
@@ -740,6 +784,21 @@ export class GpuSolver implements SolverBackend {
         this.applyPending(pend)
         applied = true
       }
+    }
+    // K-cadence: the newest submit may not have been staged - its results
+    // exist only in the device buffers. Stage a FRESH copy of the current
+    // device state and consume it inline, so flush semantics stay exact.
+    if (!this.lastSubmitStaged && this.lastMeta) {
+      const enc = this.device.createCommandEncoder()
+      const rec = this.stageReadback(enc, this.lastMeta)
+      this.device.queue.submit([enc.finish()])
+      this.beginMap(rec)
+      const ok = await rec.map
+      if (ok) {
+        this.applyPending(rec)
+        applied = true
+      }
+      this.lastSubmitStaged = true
     }
     if (applied) this.rebuildHash()
   }
@@ -840,6 +899,7 @@ export class GpuSolver implements SolverBackend {
     })
 
     staging.unmap()
+    this.resultsVersion++
   }
 
   /**

@@ -155,6 +155,8 @@ export class SimHost {
   private tickNow = 0
   /** Fixed steps run in the current tick; >1 means a catch-up burst. */
   private stepsThisTick = 0
+  /** solver.resultsVersion at the last snapshot emit, for the emit gate. */
+  private lastEmittedResults = -1
 
   /**
    * Achieved sim steps per wall second - the slow-mo readout. Measured over
@@ -261,8 +263,15 @@ export class SimHost {
     // Rate first, so the snapshot leaving this frame carries THIS frame's
     // achieved sim rate (and 0 the instant a pause lands, not a frame late).
     this.trackSimRate(this.tickNow)
-    if ((!this.paused && this.stepper.stats.stepsLastFrame > 0) || this.dirty) {
+    // Emit when RESULTS advanced, not merely when steps ran: a backend
+    // that stages readback every Kth frame moves host state every Kth
+    // tick, and per-tick emission would duplicate states into judder.
+    // Commands force an emit through `dirty` so acks keep their contract.
+    const rv = this.sim.solver.resultsVersion
+    const advanced = rv === undefined || rv !== this.lastEmittedResults
+    if ((!this.paused && this.stepper.stats.stepsLastFrame > 0 && advanced) || this.dirty) {
       this.emitSnapshot()
+      if (rv !== undefined) this.lastEmittedResults = rv
       this.dirty = false
     }
     if (this.pendingAcks.length > 0) {

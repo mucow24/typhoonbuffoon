@@ -53,6 +53,15 @@ export interface SolverBackend {
    * the CPU reference, whose forces are fresh by construction.
    */
   readonly ownsCouplingForces?: boolean
+  /**
+   * Monotonic counter, advanced whenever a frame's RESULTS become visible
+   * in the world's SoA arrays. The host gates snapshot emission on it: a
+   * backend that stages readback every Kth frame advances host state every
+   * Kth tick, and emitting per-tick would send duplicate states the
+   * renderer interpolates as hold-then-jump judder. Absent on backends
+   * whose results are visible after every step (CPU).
+   */
+  readonly resultsVersion?: number
 }
 
 /** Frame-level wave forcing, set by Conditions, applied by the backend -

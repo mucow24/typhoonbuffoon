@@ -373,10 +373,11 @@ describe('SimHost', () => {
     // Depth was once capped at 2 by FORCE LAG (host-computed buoyancy
     // acting frames late resonance-pumped a floating crate at depth 4).
     // The coupling forces are in-kernel now (ownsCouplingForces), so the
-    // readback feeds only lag-tolerant consumers and depth 3 buys the
-    // fence budget a loaded iGPU needs (~35 ms fences at 24k particles).
+    // readback feeds only lag-tolerant consumers; depth 4 plus the
+    // solver's own every-2nd-frame readback staging gives a ~133 ms fence
+    // budget - fences measured up to ~60 ms on a hot, loaded iGPU.
     const { host } = makeHost()
-    const FENCE_MS = 45
+    const FENCE_MS = 60
     const inFlight: number[] = [] // readyAt timestamps, oldest first
     let steps = 0
     const consumeReady = () => {
@@ -402,7 +403,7 @@ describe('SimHost', () => {
       // changes, this fake and this test define the latency it must hide.
       reap: async () => {
         consumeReady()
-        if (inFlight.length >= 3) await awaitFront()
+        if (inFlight.length >= 4) await awaitFront()
       },
     }
     host.enqueue({ type: 'togglePause' })
@@ -462,6 +463,41 @@ describe('SimHost', () => {
     // Steps 2+ of the burst tick must be preceded by a FLUSH, not a reap.
     const burstPre = perStep.slice(2)
     expect(burstPre.every((p) => p === 'flush')).toBe(true)
+  })
+
+  it('emits snapshots when RESULTS advance, not merely when steps run', async () => {
+    // With readback decimated (the GPU stages results every Kth frame so
+    // fences leave the critical path), host-visible state advances every
+    // Kth tick. Emitting a snapshot every tick then sends DUPLICATE states,
+    // and the renderer interpolates prev->curr as hold-then-jump judder.
+    // The backend publishes resultsVersion; the host emits when it moves
+    // (or when dirty - commands must still ack through a snapshot). A
+    // backend without the field (CPU) advances every step by construction.
+    const { host, snapshots, frame } = makeHost()
+    const solver = {
+      sync: () => {},
+      step: () => {},
+      readback: () => Promise.resolve(),
+      // reap runs twice per tick (tick top + step top): bumping every 4th
+      // call models results landing every 2nd FRAME (K=2).
+      reap: async () => {
+        reaps++
+        if (reaps % 4 === 0) solver.resultsVersion++
+      },
+      resultsVersion: 0,
+      ownsCouplingForces: true,
+    }
+    let reaps = 0
+    host.sim.solver = solver
+    host.enqueue({ type: 'togglePause' })
+    await frame() // drains the command; dirty emit
+    const before = snapshots().length
+    for (let i = 0; i < 8; i++) await frame()
+    const emitted = snapshots().length - before
+    // 8 stepped ticks, results advanced ~4 times: roughly half the
+    // snapshots, never one per tick.
+    expect(emitted).toBeGreaterThanOrEqual(3)
+    expect(emitted).toBeLessThanOrEqual(5)
   })
 
   it('pipelines catch-up bursts for a backend that owns coupling forces', async () => {

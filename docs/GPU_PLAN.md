@@ -53,8 +53,16 @@ and all three coupling forces now run IN-KERNEL from device-fresh state
 keeps its host-side passes as canon, and the world applies host passes
 exactly when the backend does not own them. Fresh forces end the depth
 ceiling and the burst flushes; the readback now feeds only damage, spawn
-guards, probes and snapshots - all lag-tolerant - so PIPELINE_DEPTH is 3
-and fences left the critical path. Rendering is also capped at ~60 fps
+guards, probes and snapshots - all lag-tolerant - so PIPELINE_DEPTH is 4, results
+stage every 2nd frame (READBACK_INTERVAL - snapshots follow the
+backend's resultsVersion so the renderer interpolates a clean signal),
+the fence budget is ~133 ms, and fences left the critical path: 7.8k
+holds 60 Hz with 0.0 ms wait even on thermally-throttled silicon
+running at a third of nominal (bench 61.9 vs 20.0 ms at 40k) and even
+tab-hidden. At that thermal state the ceiling is pure kernel EXECUTION:
+~30k runs ~21 Hz because exec alone is ~46 ms; on nominal silicon the
+same arithmetic puts 30k inside the 16.7 ms budget. Benchmark the
+silicon before benchmarking the code. Rendering is also capped at ~60 fps
 (uncapped rAF on high-refresh displays burned the same iGPU the solver
 needs: fences went ~20 -> ~46 ms median). Measured after, floor adapter,
 visible tab: 7.8k-10k at 60 Hz with 0.0 ms fence wait and ~1 ms steps
