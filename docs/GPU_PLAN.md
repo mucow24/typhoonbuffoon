@@ -21,13 +21,23 @@ compositor); anything above it, discrete GPUs included, clears 40k @ 60 Hz
 outright. An earlier ~16.7 ms median was measured before the adversarial
 review caught that the gathers lacked the CPU's mid-frame support margin;
 correctness cost ~6 ms (the margin is substep-scaled, paying only for the
-binning drift actually accrued). The wall number includes host passes, full
-state upload, encoding and submission. The readback is PIPELINED one frame
-behind (consumed at the top of the next step): a hard lesson, not an
-optimisation - the mapAsync round trip is 1-3 ms headless but up to ~25 ms
-in interactive tabs and on Optimus dGPU paths, and awaiting it in line
-capped even an IDLE scene below 60 Hz. Host logic sees positions one frame
-old, the lag this plan always budgeted for.
+binning drift actually accrued). The wall number includes host passes, state
+upload, encoding and submission. The readback is PIPELINED up to TWO frames
+deep, consumed non-blockingly (`reap()`): a hard lesson twice over, not an
+optimisation - the mapAsync FENCE costs ~17-21 ms in interactive browsers
+regardless of workload (1-3 ms headless, which is why benches missed it),
+so any loop that waits for a fence younger than that caps below 60 Hz even
+on an empty scene. Pipelining that deep is only sound because positions and
+velocities are DEVICE-RESIDENT, exactly as this plan prescribed: each frame
+chains from the GPU's own previous output, and sync() uploads only slots
+the host wrote (write-stamped creates/recycles). The first implementation
+took a stateless full-reupload shortcut instead, and under fence slip it
+re-simulated stale host state - the world forked into two interleaved
+half-rate timelines (on screen: the whole fluid blinking between two
+states, spawn guards admitting overlaps that discharged at the speed cap).
+test/gpu/pipeline.test.ts pins both the advancement rate and the recycled-
+slot stamp guard, mutation-checked. Host logic sees positions up to two
+frames old, the lag this plan always budgeted for.
 
 What shipped matches this plan with three notable learnings:
 

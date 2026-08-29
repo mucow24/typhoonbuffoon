@@ -99,6 +99,8 @@ export class CpuSolver implements SolverBackend {
     mark()
     const h = dt / w.substeps
     w.fluid.beginFrame(w.particles)
+    // The hash just rebuilt from the live SoA: every recent spawn is in it.
+    w.spawnGuardHandoff()
     lap('neighbours')
 
     for (let s = 0; s < w.substeps; s++) {

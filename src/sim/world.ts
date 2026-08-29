@@ -229,10 +229,6 @@ export class SimWorld {
   /** Everything before the solver: terrain boundary, water field, forces. */
   private frameHead(dt: number, mark: () => void, lap: (key: string) => void): void {
     this.ensureTerrainBoundary()
-    // The hash built this step sees every live particle, so the recent-spawn
-    // list has done its job and hands occupancy checks back to hasFluidNear.
-    this.recentSpawnX.length = 0
-    this.recentSpawnY.length = 0
     mark()
     this.water.build(
       this.particles,
@@ -955,6 +951,20 @@ export class SimWorld {
    */
   private readonly recentSpawnX: number[] = []
   private readonly recentSpawnY: number[] = []
+
+  /**
+   * Called by the solver backend RIGHT AFTER it (re)builds the neighbour
+   * hash: every recent spawn is now in the hash, so occupancy checks hand
+   * back to hasFluidNear. The hand-off follows the HASH, not the step
+   * counter - the pipelined GPU backend runs several steps before a frame's
+   * results land, and clearing this list per step opened a window where a
+   * spawn sat in NEITHER guard: the next stream tick double-filled the same
+   * space and the density error discharged as hypervelocity spray.
+   */
+  spawnGuardHandoff(): void {
+    this.recentSpawnX.length = 0
+    this.recentSpawnY.length = 0
+  }
 
   private nearRecentSpawn(x: number, y: number, radius: number): boolean {
     const r2 = radius * radius

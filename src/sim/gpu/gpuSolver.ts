@@ -59,13 +59,22 @@ const WG: Partial<Record<KernelName, number>> = {
  * The WebGPU backend: the same substep pipeline as CpuSolver, as compute
  * kernels (shaders.ts documents the reformulations kernel by kernel).
  *
- * The device is STATELESS ACROSS FRAMES by design: sync() re-uploads the full
- * particle/constraint/cluster state each frame (~1 MB at 40k particles,
- * fractions of a millisecond), step() encodes every substep into one compute
- * pass and submits, and readback() copies the results back into the world's
- * SoA arrays - which therefore stay canonical, so every host system (Session,
- * damage, water field, probes, snapshots) works identically on either
- * backend, and swapping backends mid-session needs no migration at all.
+ * Particle STATE (positions, velocities) is DEVICE-RESIDENT: each frame
+ * chains from the GPU's own previous output, and sync() uploads only the
+ * slots the host has written since the last capture (creates and recycles,
+ * found by write-stamp) plus the per-frame host inputs everything else needs
+ * (forces, topology, constraints, tuning). This is what makes pipelining
+ * sound: while frames are in flight the host-visible SoA lags the GPU by up
+ * to two frames, and an earlier design that re-uploaded it wholesale was
+ * re-simulating stale states whenever a fence had not landed between two
+ * steps - the world forked into two interleaved half-rate timelines,
+ * visible as the whole fluid blinking between two states (test/gpu/
+ * pipeline.test.ts pins the advancement rate).
+ *
+ * readback()/reap() copy results back into the world's SoA arrays, which
+ * stay canonical for every host system (Session, damage, water field,
+ * probes, snapshots) - identical on either backend, so swapping backends
+ * mid-session needs no migration at all.
  */
 export class GpuSolver implements SolverBackend {
   /** Probe for a device; null when WebGPU is unavailable or refuses one -
@@ -215,14 +224,47 @@ export class GpuSolver implements SolverBackend {
     this.capturedStamp = p.stampValue
     p.stampValue++
 
-    // Particle f32 sections straight from the SoA arrays.
+    // Positions and velocities are device-resident. Upload ONLY slots the
+    // host wrote since the previous sync (write-stamp > horizon), as
+    // contiguous runs - a spawn burst is a handful of runs. Never upload a
+    // clean slot: the SoA lags the device while frames are in flight, so
+    // that would rewind the particle up to two frames and jitter it.
+    {
+      const ws = p.writeStamp
+      const horizon = this.deviceStamp
+      let run0 = -1
+      const flushRun = (end: number) => {
+        if (run0 < 0) return
+        const len = end - run0
+        const wr = (sec: number, arr: Float32Array) =>
+          q.writeBuffer(
+            this.pf,
+            (sec * this.cap + run0) * 4,
+            arr.buffer,
+            arr.byteOffset + run0 * 4,
+            len * 4,
+          )
+        wr(PF.posX, p.posX)
+        wr(PF.posY, p.posY)
+        wr(PF.velX, p.velX)
+        wr(PF.velY, p.velY)
+        run0 = -1
+      }
+      for (let i = 0; i < n; i++) {
+        if (ws[i]! > horizon) {
+          if (run0 < 0) run0 = i
+        } else {
+          flushRun(i)
+        }
+      }
+      flushRun(n)
+      this.deviceStamp = this.capturedStamp
+    }
+
+    // Per-frame host inputs, full sections straight from the SoA arrays.
     const wf = (sec: number, arr: Float32Array) => {
       if (n > 0) q.writeBuffer(this.pf, sec * this.cap * 4, arr.buffer, arr.byteOffset, n * 4)
     }
-    wf(PF.posX, p.posX)
-    wf(PF.posY, p.posY)
-    wf(PF.velX, p.velX)
-    wf(PF.velY, p.velY)
     wf(PF.accX, p.accX)
     wf(PF.accY, p.accY)
     wf(PF.invMass, p.invMass)
@@ -616,6 +658,9 @@ export class GpuSolver implements SolverBackend {
    *  hide a fence latency of up to two full frames (~33 ms). */
   private pendingQ: PendingFrame[] = []
   private capturedStamp = 0
+  /** Host-write horizon already on the device: sync() uploads pos/vel only
+   *  for slots stamped after this. 0 = fresh device, upload everything. */
+  private deviceStamp = 0
 
   /**
    * FLUSH: consume every in-flight frame, waiting as long as that takes.
@@ -744,6 +789,9 @@ export class GpuSolver implements SolverBackend {
     const rq = f.spacing * 2 + f.spacing * f.supportMargin
     f.hash.setCellSize(rq)
     f.hash.build(this.w.particles, HASH_MASK)
+    // The hash now holds every recent spawn (they live in the SoA the
+    // moment the host creates them) - hand occupancy checks back to it.
+    this.w.spawnGuardHandoff()
   }
 
   // ------------------------------------------------------------- allocation
@@ -772,6 +820,12 @@ export class GpuSolver implements SolverBackend {
       return
     }
 
+    // pf is being reallocated and its pos/vel sections are DEVICE-RESIDENT
+    // (the SoA lags the GPU while frames are in flight) - carry them across
+    // on the device, or growth rewinds every particle up to two frames.
+    const oldPf: GPUBuffer | undefined = this.pf
+    const oldCap = this.cap
+
     this.cap = cap
     this.distCap = Math.max(distCap, 64)
     this.bendCap = Math.max(bendCap, 64)
@@ -791,8 +845,16 @@ export class GpuSolver implements SolverBackend {
       size: UNIFORM_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
-    this.pf?.destroy()
     this.pf = make(PF.COUNT * cap)
+    if (oldPf && oldCap > 0) {
+      const enc = dev.createCommandEncoder()
+      const words = Math.min(oldCap, cap)
+      for (const sec of [PF.posX, PF.posY, PF.velX, PF.velY]) {
+        enc.copyBufferToBuffer(oldPf, sec * oldCap * 4, this.pf, sec * cap * 4, words * 4)
+      }
+      dev.queue.submit([enc.finish()])
+    }
+    oldPf?.destroy() // after submit: in-flight work holds its reference
     this.pu?.destroy()
     this.pu = make(PU.COUNT * cap)
     this.fx?.destroy()
@@ -823,8 +885,10 @@ export class GpuSolver implements SolverBackend {
     }
 
     this.stag = stagingLayout(cap, this.distCap, this.bendCap, this.clusterStagingCap)
-    // Capacity changes only happen after the pending frame was consumed
-    // (sync runs after readback in every step), so the pair is free here.
+    // Frames still in flight reference the old staging buffers; destroying
+    // them rejects their maps, and reap() skips those applies ('err' path).
+    // The device-side chain is untouched (pos/vel copied above), so growth
+    // costs at most two frames of host VISIBILITY, once per doubling.
     for (const s of this.stagingPair) s.destroy()
     this.stagingPair = [0, 1, 2].map(() =>
       dev.createBuffer({
