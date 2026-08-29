@@ -104,6 +104,16 @@ export interface SnapshotScalars {
   /** Smoothed wall-clock cost of one sim step, ms. */
   stepMs: number
   /**
+   * Where stepMs goes, smoothed: waiting on the GPU frame queue
+   * (backpressure), host game logic (conditions + emitter), and the sim
+   * frame itself (host force passes + upload + kernel encode; on the CPU
+   * backend, the whole solve). These exist because "sim step is slow" has
+   * had three different causes already, each needing a different fix.
+   */
+  reapMs: number
+  condMs: number
+  simMs: number
+  /**
    * Achieved sim rate, steps per wall second, smoothed - 60 means real time,
    * lower means the drop-debt slow-mo contract is active. Zero while paused.
    * This is the number that answers "the HUD says slow-mo but fps reads

@@ -44,6 +44,9 @@ export class SimHost {
   private paused = true
   private breakCount = 0
   private stepMs = 0
+  private reapMs = 0
+  private condMs = 0
+  private simMs = 0
   private simFps = 0
   private rateLastNow = 0
   private rateLastSteps = 0
@@ -137,6 +140,7 @@ export class SimHost {
       // cannot clobber anything commands create next.
       await this.reapSolver()
       await this.drainCommands()
+      this.stepsThisTick = 0
       await this.stepper.advanceAsync(now)
     } finally {
       this.ticking = false
@@ -149,6 +153,8 @@ export class SimHost {
   }
 
   private tickNow = 0
+  /** Fixed steps run in the current tick; >1 means a catch-up burst. */
+  private stepsThisTick = 0
 
   /**
    * Achieved sim steps per wall second - the slow-mo readout. Measured over
@@ -210,9 +216,24 @@ export class SimHost {
   private async fixedUpdate(dt: number): Promise<void> {
     if (this.paused) return
     const t0 = performance.now()
-    await this.reapSolver()
+    // First step of the tick pipelines (reap). Every FURTHER step in the
+    // same tick FLUSHES: fences cannot resolve inside a burst, so without
+    // this every catch-up step computes buoyancy/drag from the same stale
+    // state - force lag doubles exactly when the sim is struggling, and the
+    // phase error pumps floating objects (measured: bob amplitude 0.27 m ->
+    // 2.57 m in 12 s at 52 Hz, crate airborne). Deeper slow-mo under load
+    // is honest; resonance is not. Pump steps flush too, which also makes
+    // manual stepping deterministic.
+    this.stepsThisTick++
+    if (this.stepsThisTick > 1) {
+      await this.sim.solver.readback()
+    } else {
+      await this.reapSolver()
+    }
+    const t1 = performance.now()
     this.conditions.update(dt)
     if (this.stream) this.emitter.update(this.sim, dt, this.stream.x, this.stream.y)
+    const t2 = performance.now()
     this.sim.step(dt)
     // Every frame, before any command can act on member records: breakage
     // frees constraint slots, and the session must forget those indices
@@ -225,8 +246,13 @@ export class SimHost {
       this.breakCount += this.sim.breakEvents.length
       this.sim.breakEvents.length = 0
     }
-    const cost = performance.now() - t0
-    this.stepMs = this.stepMs === 0 ? cost : this.stepMs * 0.9 + cost * 0.1
+    const t3 = performance.now()
+    const cost = t3 - t0
+    const ema = (prev: number, v: number) => (prev === 0 ? v : prev * 0.9 + v * 0.1)
+    this.stepMs = ema(this.stepMs, cost)
+    this.reapMs = ema(this.reapMs, t1 - t0)
+    this.condMs = ema(this.condMs, t2 - t1)
+    this.simMs = ema(this.simMs, t3 - t2)
   }
 
   private frameEnd(): void {
@@ -522,6 +548,9 @@ export class SimHost {
       budget: this.session.doc.budget,
       widthM: this.field.widthM,
       stepMs: this.stepMs,
+      reapMs: this.reapMs,
+      condMs: this.condMs,
+      simMs: this.simMs,
       simFps: this.simFps,
       backend: this.backendName,
     }

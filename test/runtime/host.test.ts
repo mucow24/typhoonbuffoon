@@ -362,15 +362,20 @@ describe('SimHost', () => {
     expect(last().scalars.simFps).toBe(0)
   })
 
-  it('sustains ~60 Hz against a GPU fence that lags a full frame', async () => {
-    // THE field bug, encoded: real browsers resolve mapAsync ~17-21 ms after
-    // submit even for a 256-byte copy (measured live). A host loop that ever
-    // waits for the CURRENT frame's fence caps at ~45 Hz with an EMPTY scene
-    // - which is exactly how it shipped, twice. This test drives the real
-    // host loop on a real wall clock against a backend with that latency,
+  it('sustains ~60 Hz against a GPU fence that lags two full frames', async () => {
+    // THE field bug, encoded - twice now. Real browsers resolve mapAsync
+    // ~17-21 ms after submit for a 256-byte copy on an IDLE GPU (measured
+    // live; ~46 ms median under full load). A host loop that ever waits for
+    // the CURRENT frame's fence caps at ~45 Hz with an EMPTY scene - which
+    // is exactly how it shipped, twice. This test drives the real host loop
+    // on a real wall clock against a fence just inside the depth-2 budget
     // and fails unless the loop keeps stepping while fences are in flight.
+    // The fence here must stay INSIDE ~33 ms: pipeline depth is FORCE LAG
+    // (host-computed buoyancy acts frames late), and depth 4 - tried for
+    // fence headroom - resonance-pumped a floating crate into the sky.
+    // Longer fences are paid with honest slow-mo, not with depth.
     const { host } = makeHost()
-    const FENCE_MS = 20
+    const FENCE_MS = 30
     const inFlight: number[] = [] // readyAt timestamps, oldest first
     let steps = 0
     const consumeReady = () => {
@@ -391,7 +396,9 @@ describe('SimHost', () => {
       readback: async () => {
         while (inFlight.length > 0) await awaitFront()
       },
-      // Consume what is ready; block only for backpressure at depth 2.
+      // Consume what is ready; block only for backpressure when the queue
+      // is full. Mirrors GpuSolver's PIPELINE_DEPTH - if that constant
+      // changes, this fake and this test define the latency it must hide.
       reap: async () => {
         consumeReady()
         if (inFlight.length >= 2) await awaitFront()
@@ -400,13 +407,60 @@ describe('SimHost', () => {
     host.enqueue({ type: 'togglePause' })
     const t0 = performance.now()
     host.start(t0)
-    // Drive ticks the way the worker shell does, for 1.2 s of real time.
+    // Drive ticks at a METRONOME 60 Hz for 1.2 s: virtual tick time advances
+    // exactly one frame while the pacing sleep tracks real time. Node timer
+    // jitter must not manufacture catch-up bursts here - bursts flush by
+    // design (see the burst test below) and their cost would drown the
+    // signal this test exists for: that the loop never WAITS on a fence
+    // still inside the pipeline budget. Fences stay on the real clock, so a
+    // re-serialized loop still collapses to ~25 Hz and fails loudly.
+    let vnow = t0
     while (performance.now() < t0 + 1200) {
-      await host.tick(performance.now())
-      await new Promise((r) => setTimeout(r, 4))
+      vnow += 1000 / 60
+      await host.tick(vnow)
+      const ahead = vnow - performance.now()
+      await new Promise((r) => setTimeout(r, Math.max(1, ahead)))
     }
     const hz = (steps * 1000) / (performance.now() - t0)
     expect(hz).toBeGreaterThan(55)
+  })
+
+  it('flushes GPU results before every catch-up step in a burst', async () => {
+    // Force freshness under load, encoded. In a catch-up burst (a tick that
+    // runs 2-3 fixed steps) fences cannot resolve between the steps, so
+    // every step of the burst computes buoyancy/drag from the SAME stale
+    // state - the effective force lag doubles exactly when the sim is
+    // struggling. Measured live at 7.8k/52 Hz: a floating crate's bob
+    // amplitude grew 0.27 m -> 2.57 m in 12 s and the crate left the water.
+    // The contract: the FIRST step of a tick may pipeline (reap), every
+    // FURTHER step in the same tick must flush (readback) first, trading
+    // catch-up speed for stable physics - deeper slow-mo is honest, a
+    // resonance-launched crate is not.
+    const { host } = makeHost()
+    const calls: string[] = []
+    host.sim.solver = {
+      sync: () => {},
+      step: () => calls.push('step'),
+      readback: async () => {
+        calls.push('flush')
+      },
+      reap: async () => {
+        calls.push('reap')
+      },
+    }
+    host.enqueue({ type: 'togglePause' })
+    host.start(0)
+    await host.tick(1000 / 60) // 1 step
+    // A 50 ms gap: the stepper owes 3 steps (its catch-up cap) this tick.
+    await host.tick(1000 / 60 + 50)
+    const perStep: string[] = []
+    for (let i = 0; i < calls.length; i++) {
+      if (calls[i] === 'step') perStep.push(calls[i - 1]!)
+    }
+    expect(perStep.length).toBeGreaterThanOrEqual(4)
+    // Steps 2+ of the burst tick must be preceded by a FLUSH, not a reap.
+    const burstPre = perStep.slice(2)
+    expect(burstPre.every((p) => p === 'flush')).toBe(true)
   })
 
   it('reset restores the play snapshot and pauses', async () => {

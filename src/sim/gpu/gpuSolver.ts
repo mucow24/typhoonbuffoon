@@ -23,6 +23,22 @@ import { KERNELS, type KernelName } from './shaders'
 
 const HASH_MASK = (1 << KIND_FLUID) | (1 << KIND_OBJECT) | (1 << KIND_BOUNDARY)
 
+/**
+ * Frames allowed in flight before reap() blocks. Sized from measurement,
+ * not hope: a mapAsync fence takes ~17-21 ms to observe on an IDLE iGPU in
+ * real browsers, and ~46 ms median once the same iGPU is simulating and
+ * rendering a loaded scene (7.8k particles) - so the pipeline must hide
+ * as much of that as PHYSICS allows. The ceiling is not fences - it is
+ * FORCE FRESHNESS: buoyancy/hydrostatic/drag are computed host-side from
+ * read-back state and applied by the GPU frames later, so pipeline depth is
+ * force lag. At depth 2 (33 ms, the band the physics review accepted) a
+ * floating crate bobs; at depth 4 (66 ms, tried for fence headroom) the
+ * phase error PUMPS the bob and a crate launched into the sky off calm
+ * water. Depth stays 2. Fences longer than this budget are paid with
+ * slow-mo until forces move device-side (the real headroom fix).
+ */
+const PIPELINE_DEPTH = 2
+
 /** One submitted GPU frame whose results have not been consumed yet. */
 interface PendingFrame {
   staging: GPUBuffer
@@ -65,7 +81,7 @@ const WG: Partial<Record<KernelName, number>> = {
  * found by write-stamp) plus the per-frame host inputs everything else needs
  * (forces, topology, constraints, tuning). This is what makes pipelining
  * sound: while frames are in flight the host-visible SoA lags the GPU by up
- * to two frames, and an earlier design that re-uploaded it wholesale was
+ * to PIPELINE_DEPTH frames, and an earlier design that re-uploaded it wholesale was
  * re-simulating stale states whenever a fence had not landed between two
  * steps - the world forked into two interleaved half-rate timelines,
  * visible as the whole fluid blinking between two states (test/gpu/
@@ -132,8 +148,8 @@ export class GpuSolver implements SolverBackend {
   private terr!: GPUBuffer
   private matSec!: GPUBuffer
   private gath!: GPUBuffer
-  /** Readback staging ring: up to two frames in flight (mapped) + one
-   *  being written this frame. */
+  /** Readback staging ring: up to PIPELINE_DEPTH frames in flight (mapped)
+   *  + one being written this frame. */
   private stagingPair: GPUBuffer[] = []
   private stagingFlip = 0
 
@@ -606,7 +622,7 @@ export class GpuSolver implements SolverBackend {
     // ping-pong pair that is not still mapped by the pending frame.
     const st = this.stag!
     const staging = this.stagingPair[this.stagingFlip]!
-    this.stagingFlip = (this.stagingFlip + 1) % 3
+    this.stagingFlip = (this.stagingFlip + 1) % (PIPELINE_DEPTH + 1)
     const cp = (src: GPUBuffer, srcOff: number, dstOff: number, words: number) => {
       if (words > 0) enc.copyBufferToBuffer(src, srcOff, staging, dstOff, words * 4)
     }
@@ -654,8 +670,8 @@ export class GpuSolver implements SolverBackend {
 
   // --------------------------------------------------------------- readback
 
-  /** Frames submitted but not yet consumed, oldest first. Depth 2: enough to
-   *  hide a fence latency of up to two full frames (~33 ms). */
+  /** Frames submitted but not yet consumed, oldest first. Bounded by
+   *  PIPELINE_DEPTH - see that constant for the measured latencies. */
   private pendingQ: PendingFrame[] = []
   private capturedStamp = 0
   /** Host-write horizon already on the device: sync() uploads pos/vel only
@@ -682,13 +698,13 @@ export class GpuSolver implements SolverBackend {
 
   /**
    * PIPELINED consume: apply frames whose fences have already been observed
-   * - no waiting - and block only for backpressure when the queue is full.
-   * At steady state the queue sits at depth 2 and the frame being consumed
-   * was submitted two frames ago, so its ~17-21 ms fence has long resolved
-   * and this costs ~nothing. Host state lags the GPU by two frames (~33 ms)
-   * - forces, damage, spawn guards and snapshots all tolerate that by
-   * design, and write-stamps keep host-created particles from being
-   * clobbered by frames captured before they existed.
+   * - no waiting - and block only for backpressure when the queue is full
+   * (PIPELINE_DEPTH frames in flight). At steady state the frame being
+   * consumed is several frames old, its fence long resolved, and this costs
+   * ~nothing. Host state lags the GPU accordingly - forces, damage, spawn
+   * guards and snapshots all tolerate that by design, and write-stamps keep
+   * host-created particles from being clobbered by frames captured before
+   * they existed.
    */
   async reap(): Promise<void> {
     let applied = false
@@ -699,7 +715,7 @@ export class GpuSolver implements SolverBackend {
         applied = true
       }
     }
-    if (this.pendingQ.length >= 2) {
+    if (this.pendingQ.length >= PIPELINE_DEPTH) {
       const pend = this.pendingQ.shift()!
       const ok = await pend.map
       if (ok) {
@@ -888,9 +904,9 @@ export class GpuSolver implements SolverBackend {
     // Frames still in flight reference the old staging buffers; destroying
     // them rejects their maps, and reap() skips those applies ('err' path).
     // The device-side chain is untouched (pos/vel copied above), so growth
-    // costs at most two frames of host VISIBILITY, once per doubling.
+    // costs at most PIPELINE_DEPTH frames of host VISIBILITY, per doubling.
     for (const s of this.stagingPair) s.destroy()
-    this.stagingPair = [0, 1, 2].map(() =>
+    this.stagingPair = Array.from({ length: PIPELINE_DEPTH + 1 }, () =>
       dev.createBuffer({
         size: this.stag!.totalBytes,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,

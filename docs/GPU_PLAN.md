@@ -39,6 +39,26 @@ test/gpu/pipeline.test.ts pins both the advancement rate and the recycled-
 slot stamp guard, mutation-checked. Host logic sees positions up to two
 frames old, the lag this plan always budgeted for.
 
+**The open ceiling, precisely (2026-08-29): host-side coupling forces.**
+Buoyancy, hydrostatic wall load and water drag are computed on the host
+from read-back state, so pipeline depth IS force lag - and force lag is
+dynamically unstable: at depth 4 (66 ms, tried for fence headroom) the
+phase error resonance-pumped a floating crate out of the water and into
+the sky; even at depth 2, catch-up bursts recompute forces from the same
+un-landed state, so the lag doubles exactly when the sim is struggling
+(measured: bob amplitude 0.27 m -> 2.57 m in 12 s at 52 Hz). Two
+mitigations shipped: rendering is capped at 60 fps (uncapped rAF on
+high-refresh displays burned the same iGPU the solver needs - fences went
+~20 ms -> ~46 ms median under load), and every catch-up step after the
+first in a tick FLUSHES before stepping (test-pinned), which keeps forces
+fresh at the price of honest, deeper slow-mo under load (~44 Hz at 7.8k
+on the floor adapter). The real fix, next: move the water column field
+and the coupling forces INTO kernels (the wetness census already is).
+Fresh forces every frame from device state ends the depth ceiling, the
+burst flushes, and most of the readback entirely - readback then feeds
+only damage, spawn guards, probes and snapshots, all lag-tolerant, and
+the fence stops being on the critical path at any depth.
+
 What shipped matches this plan with three notable learnings:
 
 - The dense ROW-MAJOR grid (not the CPU's hashed table) was the decisive

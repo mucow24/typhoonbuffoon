@@ -68,6 +68,7 @@ export class Game {
   private rafHandle = 0
   private running = false
   private lastTime = 0
+  private lastDraw = 0
   private smoothedFrameMs = 0
   private playButton: HTMLButtonElement | null = null
   private budgetLabel: HTMLDivElement | null = null
@@ -125,6 +126,14 @@ export class Game {
         return `${sc.simFps.toFixed(0)} / 60 Hz`
       })
       .add('sim step', () => `${(s()?.stepMs ?? 0).toFixed(1)} ms`)
+      // WHERE the step goes. "wait" is the GPU frame-queue backpressure -
+      // when it dominates, the GPU (or whatever else is using it, like an
+      // uncapped renderer) is the bottleneck, not the host code.
+      .add('step split', () => {
+        const sc = s()
+        if (!sc) return '—'
+        return `wait ${sc.reapMs.toFixed(1)} · game ${sc.condMs.toFixed(1)} · sim ${sc.simMs.toFixed(1)}`
+      })
       .add('backend', () => s()?.backend ?? 'starting')
       .add('state', () => {
         const sc = s()
@@ -444,6 +453,16 @@ export class Game {
   private tick = (now: number): void => {
     if (!this.running) return
     this.rafHandle = requestAnimationFrame(this.tick)
+
+    // Cap drawing at ~60 fps. The sim produces 60 states a second and the
+    // renderer interpolates between the last two, so frames beyond that add
+    // no information - but on high-refresh displays rAF runs at 120-165 Hz,
+    // and every extra draw burns the SAME iGPU the WebGPU solver needs:
+    // measured live, uncapped rendering stretched the solver's readback
+    // fences from ~20 ms to ~46 ms and stalled the sim itself to 43 Hz.
+    // The half-frame slack keeps a 60 Hz display's own rAF from beating.
+    if (now - this.lastDraw < 1000 / 60 - 8) return
+    this.lastDraw = now
 
     const frameMs = this.lastTime === 0 ? 1000 / 60 : now - this.lastTime
     this.lastTime = now
